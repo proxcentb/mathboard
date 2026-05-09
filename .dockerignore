@@ -1,0 +1,14 @@
+.git
+.devenv
+.direnv
+.pnpm-home
+node_modules
+apps/*/node_modules
+apps/*/dist
+coverage
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+Dockerfile
+docker-compose*.yml
