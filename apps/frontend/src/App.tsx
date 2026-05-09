@@ -2,7 +2,7 @@ import * as Toolbar from "@radix-ui/react-toolbar";
 import { Brush, Copy, Eraser, Plus, Redo2, Trash2, Undo2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
-import { API_URL, createRoom, getRoom, sendOperation } from "./api";
+import { SOCKET_URL, createRoom, getRoom, sendOperation } from "./api";
 import styles from "./App.module.css";
 import { BoardCanvas } from "./components/BoardCanvas";
 import { CanvasPreview } from "./components/CanvasPreview";
@@ -74,8 +74,9 @@ export function App() {
       return;
     }
 
-    const socket = io(API_URL, {
-      transports: ["websocket", "polling"]
+    const socket = io(SOCKET_URL, {
+      transports: ["polling", "websocket"],
+      tryAllTransports: true
     });
 
     socketRef.current = socket;

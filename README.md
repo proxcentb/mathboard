@@ -45,6 +45,23 @@ docker compose up --build -d
 APP_PORT=80 docker compose up --build -d
 ```
 
+### Docker без сборки на сервере
+
+GitHub Actions публикует готовые образы в GitHub Container Registry:
+
+- `ghcr.io/proxcentb/mathboard-frontend`
+- `ghcr.io/proxcentb/mathboard-backend`
+
+На сервере можно запускать compose, который только скачивает готовые образы:
+
+```bash
+cp .env.prod.example .env
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
+```
+
+По умолчанию используется тег `latest`. Для более предсказуемого деплоя лучше указывать конкретный тег, например `IMAGE_TAG=sha-...` из GitHub Actions.
+
 ## Что уже есть
 
 - генерация id комнаты на backend;
