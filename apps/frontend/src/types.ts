@@ -37,6 +37,24 @@ export interface RoomSnapshot {
   updatedAt: number;
 }
 
+export interface ImportedCanvasSnapshot {
+  id: string;
+  title: string;
+  strokes: Stroke[];
+  images: BoardImage[];
+}
+
+export interface ImportedRoomSnapshot {
+  canvases: ImportedCanvasSnapshot[];
+}
+
+export interface MathboardExportFile {
+  app: "mathboard";
+  version: 1;
+  exportedAt: string;
+  room: ImportedRoomSnapshot;
+}
+
 export interface RemoteCursor {
   socketId: string;
   canvasId: string;
@@ -48,6 +66,7 @@ export interface RemoteStroke {
   socketId: string;
   canvasId: string;
   stroke: Stroke;
+  isStart: boolean;
 }
 
 export interface ParticipantProfile {
@@ -74,6 +93,11 @@ export type BoardOperation =
       after: BoardImage;
     }
   | {
+      type: "image:delete";
+      canvasId: string;
+      image: BoardImage;
+    }
+  | {
       type: "canvas:clear";
       canvasId: string;
       before: {
@@ -92,3 +116,24 @@ export type BoardOperation =
       type: "history:redo";
       canvasId: string;
     };
+
+export type BroadcastOperation =
+  | Extract<
+      BoardOperation,
+      { type: "stroke:add" | "image:add" | "image:update" | "image:delete" }
+    >
+  | {
+      type: "canvas:clear";
+      canvasId: string;
+    };
+
+export interface OperationAppliedMessage {
+  socketId: string;
+  operation: BroadcastOperation;
+  updatedAt: number;
+  canvas: {
+    id: string;
+    canUndo: boolean;
+    canRedo: boolean;
+  };
+}

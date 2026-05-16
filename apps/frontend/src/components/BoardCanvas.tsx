@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import styles from "./BoardCanvas.module.css";
 import {
   BoardImage,
@@ -15,6 +15,7 @@ const CANVAS_WIDTH = 1200;
 const CANVAS_HEIGHT = 720;
 const GRID_SIZE = 24;
 const HANDLE_SIZE = 18;
+const LIVE_EVENT_INTERVAL_MS = 50;
 
 interface BoardCanvasProps {
   canvas: CanvasSnapshot;
@@ -23,10 +24,11 @@ interface BoardCanvasProps {
   size: number;
   cursors: RemoteCursor[];
   remoteStrokes: RemoteStroke[];
+  localCursorName: string;
   onOperation: (operation: BoardOperation) => void;
   onCursorMove: (canvasId: string, point: Point) => void;
   onCursorLeave: () => void;
-  onStrokePreview: (canvasId: string, stroke: Stroke) => void;
+  onStrokePreview: (canvasId: string, stroke: Stroke, isStart: boolean) => void;
   onStrokeEnd: (canvasId: string, strokeId: string) => void;
 }
 
@@ -45,27 +47,85 @@ export function BoardCanvas({
   size,
   cursors,
   remoteStrokes,
+  localCursorName,
   onOperation,
   onCursorMove,
   onCursorLeave,
   onStrokePreview,
   onStrokeEnd
 }: BoardCanvasProps) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageCacheRef = useRef(new Map<string, HTMLImageElement>());
   const draftStrokeRef = useRef<Stroke | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const pointerPointRef = useRef<Point | null>(null);
+  const cursorTimeoutRef = useRef<number | null>(null);
+  const lastCursorSentAtRef = useRef(0);
+  const pendingCursorPointRef = useRef<Point | null>(null);
   const liveStrokeTimeoutRef = useRef<number | null>(null);
   const lastLiveStrokeAtRef = useRef(0);
-  const pendingLiveStrokeRef = useRef<Stroke | null>(null);
+  const pendingLivePointsRef = useRef<Point[]>([]);
+  const liveStrokeStartedRef = useRef(false);
   const [draftStroke, setDraftStroke] = useState<Stroke | null>(null);
   const [draftImage, setDraftImage] = useState<BoardImage | null>(null);
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
   const [eraserPoint, setEraserPoint] = useState<Point | null>(null);
+  const [localCursorPoint, setLocalCursorPoint] = useState<Point | null>(null);
   const [lineStart, setLineStart] = useState<Point | null>(null);
   const [linePreviewPoint, setLinePreviewPoint] = useState<Point | null>(null);
   const [isCtrlLineActive, setIsCtrlLineActive] = useState(false);
+
+  const drawBase = useCallback(() => {
+    resizeCanvasForDisplay(baseCanvasRef.current);
+    drawBaseCanvas(
+      baseCanvasRef.current,
+      canvas,
+      imageCacheRef.current,
+      draftImage,
+      () => drawBaseCanvas(baseCanvasRef.current, canvas, imageCacheRef.current, draftImage)
+    );
+  }, [canvas, draftImage]);
+
+  const drawOverlay = useCallback(() => {
+    resizeCanvasForDisplay(overlayCanvasRef.current);
+    drawOverlayCanvas(
+      overlayCanvasRef.current,
+      canvas,
+      imageCacheRef.current,
+      draftStroke,
+      draftImage,
+      selectedImageId,
+      tool === "eraser" ? eraserPoint : null,
+      size,
+      lineStart && linePreviewPoint ? createLineStroke(lineStart, linePreviewPoint, color, size) : null,
+      cursors,
+      remoteStrokes,
+      localCursorPoint
+        ? {
+            socketId: "local",
+            canvasId: canvas.id,
+            name: localCursorName,
+            point: localCursorPoint
+          }
+        : null
+    );
+  }, [
+    canvas,
+    color,
+    cursors,
+    draftImage,
+    draftStroke,
+    eraserPoint,
+    localCursorName,
+    localCursorPoint,
+    linePreviewPoint,
+    lineStart,
+    remoteStrokes,
+    selectedImageId,
+    size,
+    tool
+  ]);
 
   useEffect(() => {
     return () => {
@@ -76,6 +136,10 @@ export function BoardCanvas({
 
       if (liveStrokeTimeoutRef.current) {
         window.clearTimeout(liveStrokeTimeoutRef.current);
+      }
+
+      if (cursorTimeoutRef.current) {
+        window.clearTimeout(cursorTimeoutRef.current);
       }
 
       onCursorLeave();
@@ -124,41 +188,116 @@ export function BoardCanvas({
   }, [tool]);
 
   useEffect(() => {
-    resizeCanvasForDisplay(canvasRef.current);
-    drawCanvas(
-      canvasRef.current,
-      canvas,
-      imageCacheRef.current,
-      draftStroke,
-      draftImage,
-      selectedImageId,
-      tool === "eraser" ? eraserPoint : null,
-      size,
-      lineStart && linePreviewPoint ? createLineStroke(lineStart, linePreviewPoint, color, size) : null,
-      cursors,
-      remoteStrokes
-    );
-  }, [
-    canvas,
-    color,
-    cursors,
-    draftImage,
-    draftStroke,
-    eraserPoint,
-    linePreviewPoint,
-    lineStart,
-    selectedImageId,
-    size,
-    tool,
-    remoteStrokes
-  ]);
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.code !== "Delete" && event.code !== "Backspace") {
+        return;
+      }
 
-  function scheduleStrokePreview(stroke: Stroke) {
-    pendingLiveStrokeRef.current = stroke;
+      const target = event.target;
+      const isTextEditing =
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        (target instanceof HTMLElement && target.isContentEditable);
+
+      if (isTextEditing || draftStrokeRef.current || dragRef.current) {
+        return;
+      }
+
+      const selectedImage = canvas.images.find((image) => image.id === selectedImageId);
+      if (!selectedImage) {
+        return;
+      }
+
+      event.preventDefault();
+      onOperation({
+        type: "image:delete",
+        canvasId: canvas.id,
+        image: selectedImage
+      });
+      setSelectedImageId(null);
+      setDraftImage(null);
+    };
+
+    document.addEventListener("keydown", handleKeyDown, { capture: true });
+    return () => document.removeEventListener("keydown", handleKeyDown, { capture: true });
+  }, [canvas.id, canvas.images, onOperation, selectedImageId]);
+
+  useEffect(() => {
+    drawBase();
+  }, [drawBase]);
+
+  useEffect(() => {
+    drawOverlay();
+  }, [drawOverlay]);
+
+  useEffect(() => {
+    let frame = 0;
+    const redraw = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        drawBase();
+        drawOverlay();
+      });
+    };
+
+    const observer = new ResizeObserver(redraw);
+    const baseCanvas = baseCanvasRef.current;
+    const overlayCanvas = overlayCanvasRef.current;
+    if (baseCanvas) {
+      observer.observe(baseCanvas);
+    }
+    if (overlayCanvas) {
+      observer.observe(overlayCanvas);
+    }
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [drawBase, drawOverlay]);
+
+  function scheduleCursorMove(point: Point, immediate = false) {
+    pendingCursorPointRef.current = point;
+    const now = window.performance.now();
+    const elapsed = now - lastCursorSentAtRef.current;
+
+    if (immediate || elapsed >= LIVE_EVENT_INTERVAL_MS) {
+      flushCursorMove();
+      return;
+    }
+
+    if (cursorTimeoutRef.current) {
+      return;
+    }
+
+    cursorTimeoutRef.current = window.setTimeout(
+      flushCursorMove,
+      LIVE_EVENT_INTERVAL_MS - elapsed
+    );
+  }
+
+  function flushCursorMove() {
+    if (cursorTimeoutRef.current) {
+      window.clearTimeout(cursorTimeoutRef.current);
+      cursorTimeoutRef.current = null;
+    }
+
+    const point = pendingCursorPointRef.current;
+    if (!point) {
+      return;
+    }
+
+    pendingCursorPointRef.current = null;
+    lastCursorSentAtRef.current = window.performance.now();
+    onCursorMove(canvas.id, point);
+  }
+
+  function scheduleStrokePreview(points: Point[]) {
+    pendingLivePointsRef.current = [...pendingLivePointsRef.current, ...points];
     const now = window.performance.now();
     const elapsed = now - lastLiveStrokeAtRef.current;
 
-    if (elapsed >= 100) {
+    if (elapsed >= LIVE_EVENT_INTERVAL_MS) {
       flushStrokePreview();
       return;
     }
@@ -167,7 +306,10 @@ export function BoardCanvas({
       return;
     }
 
-    liveStrokeTimeoutRef.current = window.setTimeout(flushStrokePreview, 100 - elapsed);
+    liveStrokeTimeoutRef.current = window.setTimeout(
+      flushStrokePreview,
+      LIVE_EVENT_INTERVAL_MS - elapsed
+    );
   }
 
   function flushStrokePreview() {
@@ -176,14 +318,23 @@ export function BoardCanvas({
       liveStrokeTimeoutRef.current = null;
     }
 
-    const stroke = pendingLiveStrokeRef.current;
-    if (!stroke) {
+    const draftStroke = draftStrokeRef.current;
+    const points = pendingLivePointsRef.current;
+    if (!draftStroke || points.length === 0) {
       return;
     }
 
-    pendingLiveStrokeRef.current = null;
+    pendingLivePointsRef.current = [];
     lastLiveStrokeAtRef.current = window.performance.now();
-    onStrokePreview(canvas.id, stroke);
+    onStrokePreview(
+      canvas.id,
+      {
+        ...draftStroke,
+        points
+      },
+      !liveStrokeStartedRef.current
+    );
+    liveStrokeStartedRef.current = true;
   }
 
   function pointFromEvent(event: React.PointerEvent<HTMLCanvasElement>): Point {
@@ -198,7 +349,8 @@ export function BoardCanvas({
     event.currentTarget.setPointerCapture(event.pointerId);
     const point = pointFromEvent(event);
     pointerPointRef.current = point;
-    onCursorMove(canvas.id, point);
+    setLocalCursorPoint(point);
+    scheduleCursorMove(point, true);
     const hit = event.altKey ? findImageHit(canvas.images, point) : null;
 
     if (tool === "pen" && lineStart && isCtrlLineActive) {
@@ -245,14 +397,17 @@ export function BoardCanvas({
     };
     draftStrokeRef.current = stroke;
     setDraftStroke(stroke);
-    scheduleStrokePreview(stroke);
+    liveStrokeStartedRef.current = false;
+    pendingLivePointsRef.current = [];
+    scheduleStrokePreview([point]);
     setSelectedImageId(null);
   }
 
   function handlePointerMove(event: React.PointerEvent<HTMLCanvasElement>) {
     const point = pointFromEvent(event);
     pointerPointRef.current = point;
-    onCursorMove(canvas.id, point);
+    setLocalCursorPoint(point);
+    scheduleCursorMove(point);
     setEraserPoint(tool === "eraser" ? point : null);
 
     if (tool === "pen" && lineStart && isCtrlLineActive && !draftStrokeRef.current && !dragRef.current) {
@@ -285,12 +440,18 @@ export function BoardCanvas({
     };
     draftStrokeRef.current = nextStroke;
     setDraftStroke(nextStroke);
-    scheduleStrokePreview(nextStroke);
+    scheduleStrokePreview([point]);
   }
 
   function handlePointerLeave() {
     pointerPointRef.current = null;
+    pendingCursorPointRef.current = null;
+    if (cursorTimeoutRef.current) {
+      window.clearTimeout(cursorTimeoutRef.current);
+      cursorTimeoutRef.current = null;
+    }
     onCursorLeave();
+    setLocalCursorPoint(null);
     if (!draftStrokeRef.current && !dragRef.current) {
       setEraserPoint(null);
     }
@@ -317,10 +478,11 @@ export function BoardCanvas({
     }
 
     const stroke = draftStrokeRef.current;
-    draftStrokeRef.current = null;
-    setDraftStroke(null);
     if (stroke && stroke.points.length > 1) {
       flushStrokePreview();
+      draftStrokeRef.current = null;
+      setDraftStroke(null);
+      liveStrokeStartedRef.current = false;
       onOperation({
         type: "stroke:add",
         canvasId: canvas.id,
@@ -330,7 +492,11 @@ export function BoardCanvas({
       return;
     }
 
+    draftStrokeRef.current = null;
+    setDraftStroke(null);
+    liveStrokeStartedRef.current = false;
     if (stroke) {
+      pendingLivePointsRef.current = [];
       onStrokeEnd(canvas.id, stroke.id);
     }
   }
@@ -339,7 +505,12 @@ export function BoardCanvas({
     <article className={styles.board}>
       <div className={styles.canvasFrame}>
         <canvas
-          ref={canvasRef}
+          ref={baseCanvasRef}
+          className={`${styles.canvas} ${styles.baseCanvas}`}
+          aria-hidden="true"
+        />
+        <canvas
+          ref={overlayCanvasRef}
           className={styles.canvas}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
@@ -353,18 +524,12 @@ export function BoardCanvas({
   );
 }
 
-function drawCanvas(
+function drawBaseCanvas(
   target: HTMLCanvasElement | null,
   canvas: CanvasSnapshot,
   cache: Map<string, HTMLImageElement>,
-  draftStroke: Stroke | null,
   draftImage: BoardImage | null,
-  selectedImageId: string | null,
-  eraserPoint: Point | null,
-  eraserSize: number,
-  linePreviewStroke: Stroke | null,
-  cursors: RemoteCursor[],
-  remoteStrokes: RemoteStroke[]
+  onImageLoad?: () => void
 ) {
   if (!target) {
     return;
@@ -376,44 +541,80 @@ function drawCanvas(
   }
 
   context.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-  drawGrid(context, CANVAS_WIDTH, CANVAS_HEIGHT);
+  drawBoardBackground(context, CANVAS_WIDTH, CANVAS_HEIGHT);
 
   const images = draftImage
     ? canvas.images.map((image) => (image.id === draftImage.id ? draftImage : image))
     : canvas.images;
 
   for (const image of images) {
-    drawImage(context, cache, image, () =>
-      drawCanvas(
-        target,
-        canvas,
-        cache,
-        draftStroke,
-        draftImage,
-        selectedImageId,
-        eraserPoint,
-        eraserSize,
-        linePreviewStroke,
-        cursors,
-        remoteStrokes
-      )
-    );
+    drawImage(context, cache, image, onImageLoad ?? (() => undefined));
   }
 
-  const strokeLayer = document.createElement("canvas");
-  strokeLayer.width = CANVAS_WIDTH;
-  strokeLayer.height = CANVAS_HEIGHT;
-  const strokeContext = strokeLayer.getContext("2d");
-  if (strokeContext) {
-    for (const stroke of [
-      ...canvas.strokes,
-      ...remoteStrokes.map((stroke) => stroke.stroke),
-      ...(draftStroke ? [draftStroke] : []),
-      ...(linePreviewStroke ? [linePreviewStroke] : [])
-    ]) {
-      drawStroke(strokeContext, stroke);
+  drawStrokeLayer(context, canvas.strokes);
+}
+
+function drawOverlayCanvas(
+  target: HTMLCanvasElement | null,
+  canvas: CanvasSnapshot,
+  cache: Map<string, HTMLImageElement>,
+  draftStroke: Stroke | null,
+  draftImage: BoardImage | null,
+  selectedImageId: string | null,
+  eraserPoint: Point | null,
+  eraserSize: number,
+  linePreviewStroke: Stroke | null,
+  cursors: RemoteCursor[],
+  remoteStrokes: RemoteStroke[],
+  localCursor: RemoteCursor | null
+) {
+  if (!target) {
+    return;
+  }
+
+  const context = target.getContext("2d");
+  if (!context) {
+    return;
+  }
+
+  context.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+  const images = draftImage
+    ? canvas.images.map((image) => (image.id === draftImage.id ? draftImage : image))
+    : canvas.images;
+
+  const overlayStrokes = [
+    ...remoteStrokes.map((stroke) => stroke.stroke),
+    ...(draftStroke ? [draftStroke] : []),
+    ...(linePreviewStroke ? [linePreviewStroke] : [])
+  ];
+
+  if (overlayStrokes.some((stroke) => stroke.tool === "eraser")) {
+    drawBoardBackground(context, CANVAS_WIDTH, CANVAS_HEIGHT);
+    for (const image of images) {
+      drawImage(context, cache, image, () =>
+        drawOverlayCanvas(
+          target,
+          canvas,
+          cache,
+          draftStroke,
+          draftImage,
+          selectedImageId,
+          eraserPoint,
+          eraserSize,
+          linePreviewStroke,
+          cursors,
+          remoteStrokes,
+          localCursor
+        )
+      );
     }
-    context.drawImage(strokeLayer, 0, 0);
+    drawStrokeLayer(context, [
+      ...canvas.strokes,
+      ...overlayStrokes
+    ]);
+  } else {
+    drawStrokeLayer(context, overlayStrokes);
   }
 
   const selected = images.find((image) => image.id === selectedImageId);
@@ -428,6 +629,49 @@ function drawCanvas(
   for (const cursor of cursors) {
     drawRemoteCursor(context, cursor);
   }
+
+  if (localCursor) {
+    drawRemoteCursor(context, localCursor);
+  }
+}
+
+function drawBoardBackground(context: CanvasRenderingContext2D, width: number, height: number) {
+  context.save();
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, width, height);
+  context.restore();
+  drawGrid(context, width, height);
+}
+
+function drawStrokeLayer(context: CanvasRenderingContext2D, strokes: Stroke[]) {
+  if (strokes.length === 0) {
+    return;
+  }
+
+  const strokeLayer = document.createElement("canvas");
+  strokeLayer.width = context.canvas.width;
+  strokeLayer.height = context.canvas.height;
+  const strokeContext = strokeLayer.getContext("2d");
+  if (!strokeContext) {
+    return;
+  }
+
+  strokeContext.setTransform(
+    strokeLayer.width / CANVAS_WIDTH,
+    0,
+    0,
+    strokeLayer.height / CANVAS_HEIGHT,
+    0,
+    0
+  );
+
+  for (const stroke of strokes) {
+    drawStroke(strokeContext, stroke);
+  }
+
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(strokeLayer, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 }
 
 function resizeCanvasForDisplay(target: HTMLCanvasElement | null) {
@@ -435,9 +679,10 @@ function resizeCanvasForDisplay(target: HTMLCanvasElement | null) {
     return;
   }
 
+  const rect = target.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
-  const width = Math.round(CANVAS_WIDTH * dpr);
-  const height = Math.round(CANVAS_HEIGHT * dpr);
+  const width = Math.max(1, Math.round(rect.width * dpr));
+  const height = Math.max(1, Math.round(rect.height * dpr));
 
   if (target.width !== width || target.height !== height) {
     target.width = width;
@@ -445,7 +690,13 @@ function resizeCanvasForDisplay(target: HTMLCanvasElement | null) {
   }
 
   const context = target.getContext("2d");
-  context?.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (!context) {
+    return;
+  }
+
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.setTransform(width / CANVAS_WIDTH, 0, 0, height / CANVAS_HEIGHT, 0, 0);
 }
 
 function drawGrid(context: CanvasRenderingContext2D, width: number, height: number) {
@@ -495,6 +746,8 @@ function drawImage(
   }
 
   if (element.complete) {
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
     context.drawImage(element, image.x, image.y, image.width, image.height);
   }
 }
@@ -569,20 +822,30 @@ function drawEraserPreview(context: CanvasRenderingContext2D, point: Point, size
 function drawRemoteCursor(context: CanvasRenderingContext2D, cursor: RemoteCursor) {
   context.save();
   context.translate(cursor.point.x, cursor.point.y);
-  context.fillStyle = "#0f766e";
+
+  context.lineCap = "round";
   context.strokeStyle = "#ffffff";
+  context.lineWidth = 4;
+  context.beginPath();
+  context.moveTo(-9, 0);
+  context.lineTo(9, 0);
+  context.moveTo(0, -9);
+  context.lineTo(0, 9);
+  context.stroke();
+
+  context.strokeStyle = "#0f766e";
   context.lineWidth = 2;
   context.beginPath();
-  context.moveTo(0, 0);
-  context.lineTo(18, 6);
-  context.lineTo(6, 18);
-  context.closePath();
+  context.moveTo(-8, 0);
+  context.lineTo(8, 0);
+  context.moveTo(0, -8);
+  context.lineTo(0, 8);
   context.stroke();
-  context.fill();
 
   context.font = "18px system-ui, sans-serif";
   context.textBaseline = "middle";
-  context.fillText(cursor.name, 18, 18);
+  context.fillStyle = "#17201f";
+  context.fillText(cursor.name, 12, 14);
   context.restore();
 }
 

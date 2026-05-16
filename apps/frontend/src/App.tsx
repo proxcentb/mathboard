@@ -1,8 +1,8 @@
 import * as Toolbar from "@radix-ui/react-toolbar";
-import { Brush, Copy, Eraser, Plus, Redo2, Trash2, Undo2 } from "lucide-react";
+import { Brush, Copy, Download, Eraser, Plus, Redo2, Trash2, Undo2, Upload } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
-import { SOCKET_URL, createRoom, getRoom, sendOperation } from "./api";
+import { SOCKET_URL, createRoom, getRoom, importRoom, sendOperation, uploadImage } from "./api";
 import styles from "./App.module.css";
 import { BoardCanvas } from "./components/BoardCanvas";
 import { CanvasPreview } from "./components/CanvasPreview";
@@ -10,6 +10,9 @@ import {
   BoardImage,
   BoardOperation,
   DrawingTool,
+  ImportedRoomSnapshot,
+  MathboardExportFile,
+  OperationAppliedMessage,
   ParticipantProfile,
   Point,
   RemoteCursor,
@@ -24,10 +27,51 @@ const DEFAULT_PROFILE: ParticipantProfile = {
   color: "#1d4ed8"
 };
 const PROFILE_EMOJIS = ["🦊", "🐼", "🐸", "🐯", "🐨", "🐰", "🐧", "🐙", "🦉", "🦁", "🐢", "🐳"];
+const MIN_TOOL_SIZE = 1;
+const MAX_BRUSH_SIZE = 48;
+const MAX_ERASER_SIZE = 120;
 
 function currentRoomId(): string | null {
   const match = window.location.pathname.match(/^\/r\/([^/]+)$/);
   return match?.[1] ?? null;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+async function imageSourceToDataUrl(src: string): Promise<string> {
+  if (src.startsWith("data:")) {
+    return src;
+  }
+
+  const response = await fetch(src);
+  if (!response.ok) {
+    throw new Error("Could not export image");
+  }
+
+  const blob = await response.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read image"));
+    reader.onload = () => resolve(String(reader.result));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function parseImportFile(content: string): MathboardExportFile {
+  const parsed = JSON.parse(content) as Partial<MathboardExportFile>;
+  if (
+    parsed.app !== "mathboard" ||
+    parsed.version !== 1 ||
+    !parsed.room ||
+    !Array.isArray(parsed.room.canvases) ||
+    parsed.room.canvases.length === 0
+  ) {
+    throw new Error("Unsupported Mathboard import file");
+  }
+
+  return parsed as MathboardExportFile;
 }
 
 export function App() {
@@ -44,6 +88,7 @@ export function App() {
   const [isEmojiPickerOpen, setIsEmojiPickerOpen] = useState(false);
   const socketRef = useRef<Socket | null>(null);
   const shouldSelectCreatedCanvasRef = useRef(false);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     const onPopState = () => setRoomId(currentRoomId());
@@ -89,14 +134,34 @@ export function App() {
     });
     socket.on("room:snapshot", (snapshot: RoomSnapshot) => {
       setRoom(snapshot);
+      setRemoteStrokes([]);
       setActiveCanvasId((current) => {
         if (shouldSelectCreatedCanvasRef.current) {
           shouldSelectCreatedCanvasRef.current = false;
           return snapshot.canvases.at(-1)?.id ?? current;
         }
 
-        return current ?? snapshot.canvases[0]?.id ?? null;
+        if (current && snapshot.canvases.some((canvas) => canvas.id === current)) {
+          return current;
+        }
+
+        return snapshot.canvases[0]?.id ?? null;
       });
+    });
+    socket.on("room:operation:applied", (message: OperationAppliedMessage) => {
+      setRoom((current) => applyBroadcastOperation(current, message));
+
+      const operation = message.operation;
+      if (operation.type === "stroke:add") {
+        setRemoteStrokes((current) =>
+          current.filter(
+            (item) =>
+              item.socketId !== message.socketId ||
+              item.canvasId !== operation.canvasId ||
+              item.stroke.id !== operation.stroke.id
+          )
+        );
+      }
     });
     socket.on("cursor:update", (cursor: RemoteCursor) => {
       setRemoteCursors((current) => [
@@ -108,12 +173,38 @@ export function App() {
       setRemoteCursors((current) => current.filter((item) => item.socketId !== socketId));
     });
     socket.on("stroke:preview", (stroke: RemoteStroke) => {
-      setRemoteStrokes((current) => [
-        ...current.filter(
-          (item) => item.socketId !== stroke.socketId || item.stroke.id !== stroke.stroke.id
-        ),
-        stroke
-      ]);
+      setRemoteStrokes((current) => {
+        const existingIndex = current.findIndex(
+          (item) =>
+            item.socketId === stroke.socketId &&
+            item.canvasId === stroke.canvasId &&
+            item.stroke.id === stroke.stroke.id
+        );
+
+        if (stroke.isStart || existingIndex === -1) {
+          return [
+            ...current.filter(
+              (item) =>
+                item.socketId !== stroke.socketId ||
+                item.canvasId !== stroke.canvasId ||
+                item.stroke.id !== stroke.stroke.id
+            ),
+            stroke
+          ];
+        }
+
+        return current.map((item, index) =>
+          index === existingIndex
+            ? {
+                ...item,
+                stroke: {
+                  ...item.stroke,
+                  points: [...item.stroke.points, ...stroke.stroke.points]
+                }
+              }
+            : item
+        );
+      });
     });
     socket.on(
       "stroke:end",
@@ -233,7 +324,7 @@ export function App() {
   }, [roomId]);
 
   const emitStrokePreview = useCallback(
-    (canvasId: string, stroke: Stroke) => {
+    (canvasId: string, stroke: Stroke, isStart: boolean) => {
       if (!roomId) {
         return;
       }
@@ -241,7 +332,8 @@ export function App() {
       socketRef.current?.emit("stroke:preview", {
         roomId,
         canvasId,
-        stroke
+        stroke,
+        isStart
       });
     },
     [roomId]
@@ -281,6 +373,92 @@ export function App() {
     });
   }, [activeCanvas, emitOperation]);
 
+  const exportRoom = useCallback(async () => {
+    if (!room) {
+      return;
+    }
+
+    const exportFile: MathboardExportFile = {
+      app: "mathboard",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      room: {
+        canvases: await Promise.all(
+          room.canvases.map(async (canvas) => ({
+            id: canvas.id,
+            title: canvas.title,
+            strokes: canvas.strokes,
+            images: await Promise.all(
+              canvas.images.map(async (image) => ({
+                ...image,
+                src: await imageSourceToDataUrl(image.src)
+              }))
+            )
+          }))
+        )
+      }
+    };
+
+    const blob = new Blob([JSON.stringify(exportFile, null, 2)], {
+      type: "application/json"
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `mathboard-${room.id}-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }, [room]);
+
+  const openImportPicker = useCallback(() => {
+    importInputRef.current?.click();
+  }, []);
+
+  const importRoomFile = useCallback(
+    async (file: File) => {
+      if (!roomId) {
+        return;
+      }
+
+      const parsed = parseImportFile(await file.text());
+      const importedSnapshot: ImportedRoomSnapshot = {
+        canvases: await Promise.all(
+          parsed.room.canvases.map(async (canvas) => ({
+            id: canvas.id || crypto.randomUUID(),
+            title: canvas.title || "Холст",
+            strokes: canvas.strokes ?? [],
+            images: await Promise.all(
+              (canvas.images ?? []).map(async (image) => {
+                if (image.src.startsWith("data:")) {
+                  const uploadedImage = await uploadImage(image.src);
+                  return {
+                    ...image,
+                    src: uploadedImage.src
+                  };
+                }
+
+                return image;
+              })
+            )
+          }))
+        )
+      };
+
+      setRemoteCursors([]);
+      setRemoteStrokes([]);
+      const socket = socketRef.current;
+      if (socket?.connected) {
+        socket.emit("room:replace", { roomId, snapshot: importedSnapshot });
+        return;
+      }
+
+      const snapshot = await importRoom(roomId, importedSnapshot);
+      setRoom(snapshot);
+      setActiveCanvasId(snapshot.canvases[0]?.id ?? null);
+    },
+    [roomId]
+  );
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target;
@@ -311,6 +489,23 @@ export function App() {
         return;
       }
 
+      if (event.code === "BracketLeft" || event.code === "BracketRight") {
+        event.preventDefault();
+        const direction = event.code === "BracketRight" ? 1 : -1;
+
+        if (tool === "pen") {
+          setBrushSize((current) =>
+            clamp(current + direction, MIN_TOOL_SIZE, MAX_BRUSH_SIZE)
+          );
+        } else {
+          setEraserSize((current) =>
+            clamp(current + direction, MIN_TOOL_SIZE, MAX_ERASER_SIZE)
+          );
+        }
+
+        return;
+      }
+
       if (event.code === "KeyB") {
         event.preventDefault();
         setTool("pen");
@@ -324,7 +519,7 @@ export function App() {
 
     document.addEventListener("keydown", onKeyDown, { capture: true });
     return () => document.removeEventListener("keydown", onKeyDown, { capture: true });
-  }, [activeCanvas, emitOperation]);
+  }, [activeCanvas, emitOperation, tool]);
 
   useEffect(() => {
     const onPaste = (event: ClipboardEvent) => {
@@ -348,19 +543,21 @@ export function App() {
         image.onload = () => {
           const maxWidth = 420;
           const scale = Math.min(1, maxWidth / image.naturalWidth);
-          const pastedImage: BoardImage = {
-            id: crypto.randomUUID(),
-            src,
-            x: 96,
-            y: 96,
-            width: Math.max(80, Math.round(image.naturalWidth * scale)),
-            height: Math.max(80, Math.round(image.naturalHeight * scale))
-          };
+          void uploadImage(src).then((uploadedImage) => {
+            const pastedImage: BoardImage = {
+              id: crypto.randomUUID(),
+              src: uploadedImage.src,
+              x: 96,
+              y: 96,
+              width: Math.max(80, Math.round(image.naturalWidth * scale)),
+              height: Math.max(80, Math.round(image.naturalHeight * scale))
+            };
 
-          emitOperation({
-            type: "image:add",
-            canvasId: activeCanvas.id,
-            image: pastedImage
+            emitOperation({
+              type: "image:add",
+              canvasId: activeCanvas.id,
+              image: pastedImage
+            });
           });
         };
         image.src = src;
@@ -380,14 +577,40 @@ export function App() {
     <main className={styles.appShell}>
       <aside className={styles.sidebar}>
         <div className={styles.identity}>
-          <div className={styles.logo}>M</div>
           <div>
             <h1>Mathboard</h1>
             <span className={styles.roomLine}>/r/{roomId}</span>
           </div>
-          <button className={styles.copyButton} onClick={copyLink} type="button" aria-label="Скопировать ссылку">
-            <Copy size={16} />
-          </button>
+          <div className={styles.identityActions}>
+            <button
+              className={styles.copyButton}
+              onClick={copyLink}
+              type="button"
+              aria-label="Скопировать ссылку"
+              title="Copy link"
+            >
+              <Copy size={16} />
+            </button>
+            <button
+              className={styles.copyButton}
+              onClick={openImportPicker}
+              type="button"
+              aria-label="Импортировать JSON"
+              title="Import"
+            >
+              <Upload size={16} />
+            </button>
+            <button
+              className={styles.copyButton}
+              onClick={exportRoom}
+              disabled={!room}
+              type="button"
+              aria-label="Экспортировать JSON"
+              title="Export"
+            >
+              <Download size={16} />
+            </button>
+          </div>
         </div>
 
         <Toolbar.Root className={styles.toolbar} aria-label="Инструменты доски">
@@ -457,8 +680,8 @@ export function App() {
             <strong>{tool === "pen" ? brushSize : eraserSize}px</strong>
             <input
               type="range"
-              min={1}
-              max={tool === "pen" ? 48 : 80}
+              min={MIN_TOOL_SIZE}
+              max={tool === "pen" ? MAX_BRUSH_SIZE : MAX_ERASER_SIZE}
               value={tool === "pen" ? brushSize : eraserSize}
               onChange={(event) => {
                 const nextValue = Number(event.target.value);
@@ -479,9 +702,9 @@ export function App() {
               }
               disabled={!activeCanvas?.canUndo}
               aria-label="Отменить"
+              title="Назад"
             >
               <Undo2 size={17} />
-              <span>Назад</span>
             </Toolbar.Button>
             <Toolbar.Button
               className={styles.actionButton}
@@ -490,22 +713,36 @@ export function App() {
               }
               disabled={!activeCanvas?.canRedo}
               aria-label="Вернуть"
+              title="Вперед"
             >
               <Redo2 size={17} />
-              <span>Вперед</span>
+            </Toolbar.Button>
+            <Toolbar.Button
+              className={styles.actionButton}
+              onClick={clearCanvas}
+              disabled={!activeCanvas || (activeCanvas.strokes.length === 0 && activeCanvas.images.length === 0)}
+              aria-label="Очистить холст"
+              title="Очистить холст"
+            >
+              <Trash2 size={17} />
             </Toolbar.Button>
           </div>
 
-          <Toolbar.Button
-            className={styles.actionButton}
-            onClick={clearCanvas}
-            disabled={!activeCanvas || (activeCanvas.strokes.length === 0 && activeCanvas.images.length === 0)}
-            aria-label="Очистить холст"
-          >
-            <Trash2 size={17} />
-            <span>Очистить холст</span>
-          </Toolbar.Button>
         </Toolbar.Root>
+
+        <input
+          ref={importInputRef}
+          hidden
+          type="file"
+          accept="application/json,.json"
+          onChange={(event) => {
+            const file = event.currentTarget.files?.[0];
+            event.currentTarget.value = "";
+            if (file) {
+              void importRoomFile(file);
+            }
+          }}
+        />
 
         <section className={styles.previewPanel} aria-label="Холсты">
           <div className={styles.previewList}>
@@ -539,6 +776,7 @@ export function App() {
             size={tool === "pen" ? brushSize : eraserSize}
             cursors={activeCanvasCursors}
             remoteStrokes={activeCanvasRemoteStrokes}
+            localCursorName={profile.name}
             onOperation={emitOperation}
             onCursorMove={emitCursorMove}
             onCursorLeave={emitCursorLeave}
@@ -582,6 +820,7 @@ function applyOptimisticOperation(
   if (
     operation.type !== "stroke:add" &&
     operation.type !== "image:add" &&
+    operation.type !== "image:delete" &&
     operation.type !== "image:update" &&
     operation.type !== "canvas:clear"
   ) {
@@ -614,6 +853,15 @@ function applyOptimisticOperation(
         };
       }
 
+      if (operation.type === "image:delete") {
+        return {
+          ...canvas,
+          images: canvas.images.filter((image) => image.id !== operation.image.id),
+          canUndo: true,
+          canRedo: false
+        };
+      }
+
       if (operation.type === "canvas:clear") {
         return {
           ...canvas,
@@ -631,6 +879,72 @@ function applyOptimisticOperation(
         ),
         canUndo: true,
         canRedo: false
+      };
+    })
+  };
+}
+
+function applyBroadcastOperation(
+  room: RoomSnapshot | null,
+  message: OperationAppliedMessage
+): RoomSnapshot | null {
+  const operation = message.operation;
+  if (!room) {
+    return room;
+  }
+
+  return {
+    ...room,
+    updatedAt: message.updatedAt,
+    canvases: room.canvases.map((canvas) => {
+      if (canvas.id !== operation.canvasId) {
+        return canvas;
+      }
+
+      const nextCanvas = {
+        ...canvas,
+        canUndo: message.canvas.canUndo,
+        canRedo: message.canvas.canRedo
+      };
+
+      if (operation.type === "stroke:add") {
+        return {
+          ...nextCanvas,
+          strokes: nextCanvas.strokes.some((stroke) => stroke.id === operation.stroke.id)
+            ? nextCanvas.strokes
+            : [...nextCanvas.strokes, operation.stroke]
+        };
+      }
+
+      if (operation.type === "image:add") {
+        return {
+          ...nextCanvas,
+          images: nextCanvas.images.some((image) => image.id === operation.image.id)
+            ? nextCanvas.images
+            : [...nextCanvas.images, operation.image]
+        };
+      }
+
+      if (operation.type === "image:delete") {
+        return {
+          ...nextCanvas,
+          images: nextCanvas.images.filter((image) => image.id !== operation.image.id)
+        };
+      }
+
+      if (operation.type === "canvas:clear") {
+        return {
+          ...nextCanvas,
+          strokes: [],
+          images: []
+        };
+      }
+
+      return {
+        ...nextCanvas,
+        images: nextCanvas.images.map((image) =>
+          image.id === operation.after.id ? operation.after : image
+        )
       };
     })
   };

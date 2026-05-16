@@ -1,10 +1,11 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { randomUUID } from "node:crypto";
 import {
   BoardImage,
   BoardOperation,
   CanvasSnapshot,
   ClientOperation,
+  ImportedRoomSnapshot,
   RoomSnapshot,
   Stroke
 } from "./board.types";
@@ -24,9 +25,15 @@ interface RoomState {
   updatedAt: number;
 }
 
+interface StoredImage {
+  contentType: string;
+  data: Buffer;
+}
+
 @Injectable()
 export class BoardService {
   private readonly rooms = new Map<string, RoomState>();
+  private readonly images = new Map<string, StoredImage>();
 
   createRoom(): RoomSnapshot {
     const id = this.createReadableId();
@@ -54,6 +61,57 @@ export class BoardService {
 
     this.rooms.set(id, room);
     return this.toSnapshot(room);
+  }
+
+  replaceRoom(roomId: string, snapshot: ImportedRoomSnapshot): RoomSnapshot {
+    if (snapshot.canvases.length === 0) {
+      throw new BadRequestException("Imported room must contain at least one canvas");
+    }
+
+    const room: RoomState = {
+      id: roomId,
+      updatedAt: Date.now(),
+      canvases: snapshot.canvases.map((canvas, index): CanvasState => ({
+        id: canvas.id || randomUUID(),
+        title: canvas.title || `Холст ${index + 1}`,
+        strokes: canvas.strokes,
+        images: canvas.images,
+        history: [],
+        future: []
+      }))
+    };
+
+    this.rooms.set(roomId, room);
+    return this.toSnapshot(room);
+  }
+
+  storeImage(dataUrl: string): { id: string } {
+    const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/);
+    if (!match) {
+      throw new BadRequestException("Expected a base64 data URL");
+    }
+
+    const [, contentType, base64] = match;
+    if (!contentType.startsWith("image/")) {
+      throw new BadRequestException("Only images can be uploaded");
+    }
+
+    const id = randomUUID();
+    this.images.set(id, {
+      contentType,
+      data: Buffer.from(base64, "base64")
+    });
+
+    return { id };
+  }
+
+  getImage(id: string): StoredImage {
+    const image = this.images.get(id);
+    if (!image) {
+      throw new NotFoundException(`Image ${id} does not exist`);
+    }
+
+    return image;
   }
 
   applyClientOperation(roomId: string, operation: ClientOperation): RoomSnapshot {
@@ -110,6 +168,11 @@ export class BoardService {
       return;
     }
 
+    if (operation.type === "image:delete") {
+      canvas.images = canvas.images.filter((image) => image.id !== operation.image.id);
+      return;
+    }
+
     if (operation.type === "canvas:clear") {
       canvas.strokes = [];
       canvas.images = [];
@@ -129,6 +192,11 @@ export class BoardService {
 
     if (operation.type === "image:add") {
       canvas.images = canvas.images.filter((image) => image.id !== operation.image.id);
+      return;
+    }
+
+    if (operation.type === "image:delete") {
+      canvas.images.push(operation.image);
       return;
     }
 

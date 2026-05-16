@@ -1,9 +1,9 @@
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import { BoardImage, CanvasSnapshot, Stroke } from "../types";
 import styles from "./CanvasPreview.module.css";
 
-const PREVIEW_WIDTH = 260;
-const PREVIEW_HEIGHT = 156;
+const FALLBACK_PREVIEW_WIDTH = 260;
+const FALLBACK_PREVIEW_HEIGHT = 156;
 const SOURCE_WIDTH = 1200;
 const SOURCE_HEIGHT = 720;
 const GRID_SIZE = 24;
@@ -12,13 +12,33 @@ interface CanvasPreviewProps {
   canvas: CanvasSnapshot;
 }
 
-export function CanvasPreview({ canvas }: CanvasPreviewProps) {
+export const CanvasPreview = memo(function CanvasPreview({ canvas }: CanvasPreviewProps) {
   const ref = useRef<HTMLCanvasElement | null>(null);
   const cacheRef = useRef(new Map<string, HTMLImageElement>());
 
   useEffect(() => {
-    resizePreviewForDisplay(ref.current);
-    drawPreview(ref.current, canvas, cacheRef.current);
+    const draw = () => {
+      resizePreviewForDisplay(ref.current);
+      drawPreview(ref.current, canvas, cacheRef.current);
+    };
+
+    draw();
+
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(draw);
+    });
+
+    const target = ref.current;
+    if (target) {
+      observer.observe(target);
+    }
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
   }, [canvas]);
 
   return (
@@ -28,7 +48,7 @@ export function CanvasPreview({ canvas }: CanvasPreviewProps) {
       aria-hidden
     />
   );
-}
+});
 
 function drawPreview(
   target: HTMLCanvasElement | null,
@@ -44,28 +64,14 @@ function drawPreview(
     return;
   }
 
-  context.clearRect(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
-
-  context.save();
-  context.scale(PREVIEW_WIDTH / SOURCE_WIDTH, PREVIEW_HEIGHT / SOURCE_HEIGHT);
+  context.clearRect(0, 0, SOURCE_WIDTH, SOURCE_HEIGHT);
   drawGrid(context, SOURCE_WIDTH, SOURCE_HEIGHT);
 
   for (const image of canvas.images) {
     drawImage(context, cache, image, () => drawPreview(target, canvas, cache));
   }
 
-  const strokeLayer = document.createElement("canvas");
-  strokeLayer.width = SOURCE_WIDTH;
-  strokeLayer.height = SOURCE_HEIGHT;
-  const strokeContext = strokeLayer.getContext("2d");
-  if (strokeContext) {
-    for (const stroke of canvas.strokes) {
-      drawStroke(strokeContext, stroke);
-    }
-    context.drawImage(strokeLayer, 0, 0);
-  }
-
-  context.restore();
+  drawStrokeLayer(context, canvas.strokes);
 }
 
 function resizePreviewForDisplay(target: HTMLCanvasElement | null) {
@@ -73,9 +79,12 @@ function resizePreviewForDisplay(target: HTMLCanvasElement | null) {
     return;
   }
 
+  const rect = target.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
-  const width = Math.round(PREVIEW_WIDTH * dpr);
-  const height = Math.round(PREVIEW_HEIGHT * dpr);
+  const displayWidth = rect.width || FALLBACK_PREVIEW_WIDTH;
+  const displayHeight = rect.height || FALLBACK_PREVIEW_HEIGHT;
+  const width = Math.max(1, Math.round(displayWidth * dpr));
+  const height = Math.max(1, Math.round(displayHeight * dpr));
 
   if (target.width !== width || target.height !== height) {
     target.width = width;
@@ -83,7 +92,44 @@ function resizePreviewForDisplay(target: HTMLCanvasElement | null) {
   }
 
   const context = target.getContext("2d");
-  context?.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (!context) {
+    return;
+  }
+
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.setTransform(width / SOURCE_WIDTH, 0, 0, height / SOURCE_HEIGHT, 0, 0);
+}
+
+function drawStrokeLayer(context: CanvasRenderingContext2D, strokes: Stroke[]) {
+  if (strokes.length === 0) {
+    return;
+  }
+
+  const strokeLayer = document.createElement("canvas");
+  strokeLayer.width = context.canvas.width;
+  strokeLayer.height = context.canvas.height;
+  const strokeContext = strokeLayer.getContext("2d");
+  if (!strokeContext) {
+    return;
+  }
+
+  strokeContext.setTransform(
+    strokeLayer.width / SOURCE_WIDTH,
+    0,
+    0,
+    strokeLayer.height / SOURCE_HEIGHT,
+    0,
+    0
+  );
+
+  for (const stroke of strokes) {
+    drawStroke(strokeContext, stroke);
+  }
+
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(strokeLayer, 0, 0, SOURCE_WIDTH, SOURCE_HEIGHT);
 }
 
 function drawGrid(context: CanvasRenderingContext2D, width: number, height: number) {
@@ -123,6 +169,8 @@ function drawImage(
   }
 
   if (element.complete) {
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
     context.drawImage(element, image.x, image.y, image.width, image.height);
   }
 }

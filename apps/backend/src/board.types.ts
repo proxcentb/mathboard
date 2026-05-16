@@ -37,6 +37,17 @@ export interface RoomSnapshot {
   updatedAt: number;
 }
 
+export interface ImportedCanvasSnapshot {
+  id: string;
+  title: string;
+  strokes: Stroke[];
+  images: BoardImage[];
+}
+
+export interface ImportedRoomSnapshot {
+  canvases: ImportedCanvasSnapshot[];
+}
+
 export type BoardOperation =
   | {
       type: "stroke:add";
@@ -53,6 +64,11 @@ export type BoardOperation =
       canvasId: string;
       before: BoardImage;
       after: BoardImage;
+    }
+  | {
+      type: "image:delete";
+      canvasId: string;
+      image: BoardImage;
     }
   | {
       type: "canvas:clear";
@@ -77,9 +93,32 @@ export type ClientOperation =
       canvasId: string;
     };
 
+export type BroadcastOperation =
+  | Exclude<BoardOperation, { type: "canvas:clear" }>
+  | {
+      type: "canvas:clear";
+      canvasId: string;
+    };
+
 export interface ClientOperationMessage {
   roomId: string;
   operation: ClientOperation;
+}
+
+export interface ReplaceRoomMessage {
+  roomId: string;
+  snapshot: ImportedRoomSnapshot;
+}
+
+export interface OperationAppliedMessage {
+  socketId: string;
+  operation: BroadcastOperation;
+  updatedAt: number;
+  canvas: {
+    id: string;
+    canUndo: boolean;
+    canRedo: boolean;
+  };
 }
 
 export interface JoinRoomMessage {
@@ -107,6 +146,7 @@ export interface StrokePreviewMessage {
   roomId: string;
   canvasId: string;
   stroke: Stroke;
+  isStart: boolean;
 }
 
 export interface StrokeEndMessage {

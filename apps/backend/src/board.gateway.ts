@@ -10,11 +10,13 @@ import {
 import { Server, Socket } from "socket.io";
 import { BoardService } from "./board.service";
 import {
+  BroadcastOperation,
   ClientOperationMessage,
   CursorLeaveMessage,
   CursorUpdateMessage,
   JoinRoomMessage,
   ParticipantProfile,
+  ReplaceRoomMessage,
   StrokeEndMessage,
   StrokePreviewMessage
 } from "./board.types";
@@ -75,8 +77,46 @@ export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage("room:operation")
-  applyOperation(@MessageBody() payload: ClientOperationMessage): void {
-    const snapshot = this.boardService.applyClientOperation(payload.roomId, payload.operation);
+  applyOperation(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: ClientOperationMessage
+  ): void {
+    const operation = payload.operation;
+    const snapshot = this.boardService.applyClientOperation(payload.roomId, operation);
+
+    if (operation.type === "canvas:create") {
+      this.server.to(payload.roomId).emit("room:snapshot", snapshot);
+      return;
+    }
+
+    if (
+      operation.type === "history:undo" ||
+      operation.type === "history:redo"
+    ) {
+      this.server.to(payload.roomId).emit("room:snapshot", snapshot);
+      return;
+    }
+
+    const canvas = snapshot.canvases.find((item) => item.id === operation.canvasId);
+    if (!canvas) {
+      return;
+    }
+
+    client.broadcast.to(payload.roomId).emit("room:operation:applied", {
+      socketId: client.id,
+      operation: this.toBroadcastOperation(operation),
+      updatedAt: snapshot.updatedAt,
+      canvas: {
+        id: canvas.id,
+        canUndo: canvas.canUndo,
+        canRedo: canvas.canRedo
+      }
+    });
+  }
+
+  @SubscribeMessage("room:replace")
+  replaceRoom(@MessageBody() payload: ReplaceRoomMessage): void {
+    const snapshot = this.boardService.replaceRoom(payload.roomId, payload.snapshot);
     this.server.to(payload.roomId).emit("room:snapshot", snapshot);
   }
 
@@ -108,7 +148,8 @@ export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
     client.broadcast.to(payload.roomId).emit("stroke:preview", {
       socketId: client.id,
       canvasId: payload.canvasId,
-      stroke: payload.stroke
+      stroke: payload.stroke,
+      isStart: payload.isStart
     });
   }
 
@@ -155,5 +196,16 @@ export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const rooms = this.socketRooms.get(socketId) ?? new Set<string>();
     rooms.add(roomId);
     this.socketRooms.set(socketId, rooms);
+  }
+
+  private toBroadcastOperation(operation: BroadcastOperation): BroadcastOperation {
+    if (operation.type !== "canvas:clear") {
+      return operation;
+    }
+
+    return {
+      type: "canvas:clear",
+      canvasId: operation.canvasId
+    };
   }
 }
