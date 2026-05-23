@@ -37,6 +37,37 @@ export interface RoomSnapshot {
   updatedAt: number;
 }
 
+export interface AdminRoomSummary {
+  id: string;
+  updatedAt: number;
+  canvasCount: number;
+  strokeCount: number;
+  imageCount: number;
+  operationCount: number;
+}
+
+export interface AdminSummary {
+  generatedAt: number;
+  rooms: AdminRoomSummary[];
+  totals: {
+    rooms: number;
+    canvases: number;
+    strokes: number;
+    images: number;
+    storedImageBytes: number;
+  };
+  process: {
+    pid: number;
+    uptimeSeconds: number;
+    memory: NodeJS.MemoryUsage;
+    cpu: {
+      userSeconds: number;
+      systemSeconds: number;
+      percent: number | null;
+    };
+  };
+}
+
 export interface ImportedCanvasSnapshot {
   id: string;
   title: string;
@@ -129,12 +160,27 @@ export interface ParticipantProfile {
   slot: number;
   name: string;
   color: string;
+  avatar?: ParticipantAvatar;
 }
+
+export type ParticipantAvatar =
+  | {
+      type: "emoji";
+      value: string;
+    }
+  | {
+      type: "image";
+      name: string;
+      src?: string;
+      alt?: string;
+    };
 
 export interface CursorUpdateMessage {
   roomId: string;
   canvasId: string;
   name: string;
+  color?: string;
+  avatar?: ParticipantAvatar;
   point: Point;
 }
 

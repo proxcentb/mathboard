@@ -18,6 +18,12 @@ pnpm install
 pnpm dev
 ```
 
+Для локальной админки backend читает `apps/backend/.env`. Минимальный пример:
+
+```bash
+cp apps/backend/.env.example apps/backend/.env
+```
+
 Или через процессы devenv:
 
 ```bash
@@ -45,6 +51,21 @@ docker compose up --build -d
 APP_PORT=80 docker compose up --build -d
 ```
 
+Для production обязательно задайте пароль администратора:
+
+```bash
+ADMIN_PASSWORD='long-random-password' docker compose up --build -d
+```
+
+Админка доступна на `/admin`. Она показывает страницы, которые сейчас есть в памяти backend, память/CPU процесса и позволяет открыть или удалить страницу из памяти.
+
+Для больших импортов/экспортов конфигурации есть два лимита backend:
+
+- `REQUEST_BODY_LIMIT`, по умолчанию `250mb`, лимит JSON HTTP-запросов.
+- `SOCKET_MAX_HTTP_BUFFER_SIZE`, по умолчанию `262144000`, лимит Socket.IO сообщений.
+
+Nginx в frontend-контейнере не ограничивает размер тела запроса (`client_max_body_size 0`), поэтому для очень больших конфигураций поднимайте эти backend-переменные под размер вашего сервера.
+
 ### Docker без сборки на сервере
 
 GitHub Actions публикует готовые образы в GitHub Container Registry:
@@ -56,6 +77,7 @@ GitHub Actions публикует готовые образы в GitHub Containe
 
 ```bash
 cp .env.prod.example .env
+# обязательно отредактируйте ADMIN_PASSWORD перед запуском
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
 ```

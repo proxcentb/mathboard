@@ -40,7 +40,8 @@ const PARTICIPANT_PROFILES: Array<Omit<ParticipantProfile, "slot">> = [
   cors: {
     origin: true,
     credentials: true
-  }
+  },
+  maxHttpBufferSize: Number(process.env.SOCKET_MAX_HTTP_BUFFER_SIZE ?? 250 * 1024 * 1024)
 })
 export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
@@ -129,6 +130,8 @@ export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
       socketId: client.id,
       canvasId: payload.canvasId,
       name: payload.name,
+      color: payload.color,
+      avatar: payload.avatar,
       point: payload.point
     });
   }

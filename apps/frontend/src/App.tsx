@@ -1,21 +1,49 @@
 import * as Toolbar from "@radix-ui/react-toolbar";
-import { Brush, Copy, Download, Eraser, Plus, Redo2, Trash2, Undo2, Upload } from "lucide-react";
+import {
+  Brush,
+  Copy,
+  Download,
+  Eraser,
+  ExternalLink,
+  LogIn,
+  Plus,
+  RefreshCw,
+  Redo2,
+  Trash2,
+  Undo2,
+  Upload
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent } from "react";
 import { io, Socket } from "socket.io-client";
-import { SOCKET_URL, createRoom, getRoom, importRoom, sendOperation, uploadImage } from "./api";
+import {
+  SOCKET_URL,
+  createRoom,
+  deleteAdminRoom,
+  getAdminSummary,
+  getRoom,
+  importRoom,
+  sendOperation,
+  uploadImage
+} from "./api";
 import styles from "./App.module.css";
 import { BoardCanvas } from "./components/BoardCanvas";
 import { CanvasPreview } from "./components/CanvasPreview";
+import { listVisibleCursorAvatars, resolveCursorAvatarSrc } from "./cursorAssets";
 import {
   BoardImage,
   BoardOperation,
+  AdminSummary,
   DrawingTool,
   ImportedRoomSnapshot,
   MathboardExportFile,
   OperationAppliedMessage,
+  ParticipantAvatar,
   ParticipantProfile,
   Point,
   RemoteCursor,
+  RemoteCursorEvent,
+  RemoteCursorStore,
   RemoteStroke,
   RoomSnapshot,
   Stroke
@@ -27,6 +55,21 @@ const DEFAULT_PROFILE: ParticipantProfile = {
   color: "#1d4ed8"
 };
 const PROFILE_EMOJIS = ["🦊", "🐼", "🐸", "🐯", "🐨", "🐰", "🐧", "🐙", "🦉", "🦁", "🐢", "🐳"];
+const PROFILE_CHOICES = [
+  ...PROFILE_EMOJIS.map((emoji) => ({
+    id: emoji,
+    name: emoji,
+    avatar: {
+      type: "emoji",
+      value: emoji
+    } satisfies ParticipantAvatar
+  })),
+  ...listVisibleCursorAvatars().map((avatar) => ({
+    id: `cursor:${avatar.type === "image" ? avatar.name : avatar.value}`,
+    name: avatar.type === "image" ? avatar.name : avatar.value,
+    avatar
+  }))
+];
 const MIN_TOOL_SIZE = 1;
 const MAX_BRUSH_SIZE = 48;
 const MAX_ERASER_SIZE = 120;
@@ -34,6 +77,10 @@ const MAX_ERASER_SIZE = 120;
 function currentRoomId(): string | null {
   const match = window.location.pathname.match(/^\/r\/([^/]+)$/);
   return match?.[1] ?? null;
+}
+
+function currentPath(): string {
+  return window.location.pathname;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -74,7 +121,86 @@ function parseImportFile(content: string): MathboardExportFile {
   return parsed as MathboardExportFile;
 }
 
+function profileAvatar(profile: ParticipantProfile): ParticipantAvatar {
+  return (
+    profile.avatar ?? {
+      type: "emoji",
+      value: profile.name
+    }
+  );
+}
+
+function avatarKey(avatar: ParticipantAvatar): string {
+  return avatar.type === "emoji" ? `emoji:${avatar.value}` : `image:${avatar.name}`;
+}
+
+function renderAvatar(avatar: ParticipantAvatar, className?: string) {
+  if (avatar.type === "emoji") {
+    return avatar.value;
+  }
+
+  const src = resolveCursorAvatarSrc(avatar);
+  if (!src) {
+    return avatar.alt ?? avatar.name;
+  }
+
+  return <img className={className} src={src} alt={avatar.alt ?? avatar.name} draggable={false} />;
+}
+
+function localCursorImageSrc(avatar: ParticipantAvatar): string | undefined {
+  if (avatar.type !== "image") {
+    return undefined;
+  }
+
+  return resolveCursorAvatarSrc(avatar);
+}
+
+interface RemoteCursorController extends RemoteCursorStore {
+  update: (cursor: RemoteCursor) => void;
+  leave: (socketId: string) => void;
+  clear: () => void;
+}
+
+function createRemoteCursorController(): RemoteCursorController {
+  const cursors = new Map<string, RemoteCursor>();
+  const listeners = new Set<(event: RemoteCursorEvent) => void>();
+
+  function emit(event: RemoteCursorEvent) {
+    for (const listener of listeners) {
+      listener(event);
+    }
+  }
+
+  return {
+    getSnapshot: () => Array.from(cursors.values()),
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    update: (cursor) => {
+      cursors.set(cursor.socketId, cursor);
+      emit({ type: "update", cursor });
+    },
+    leave: (socketId) => {
+      if (!cursors.delete(socketId)) {
+        return;
+      }
+      emit({ type: "leave", socketId });
+    },
+    clear: () => {
+      const socketIds = Array.from(cursors.keys());
+      cursors.clear();
+      for (const socketId of socketIds) {
+        emit({ type: "leave", socketId });
+      }
+    }
+  };
+}
+
 export function App() {
+  const [path, setPath] = useState(() => currentPath());
   const [roomId, setRoomId] = useState(() => currentRoomId());
   const [room, setRoom] = useState<RoomSnapshot | null>(null);
   const [tool, setTool] = useState<DrawingTool>("pen");
@@ -82,19 +208,25 @@ export function App() {
   const [brushSize, setBrushSize] = useState(1);
   const [eraserSize, setEraserSize] = useState(50);
   const [activeCanvasId, setActiveCanvasId] = useState<string | null>(null);
-  const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
   const [remoteStrokes, setRemoteStrokes] = useState<RemoteStroke[]>([]);
   const [profile, setProfile] = useState<ParticipantProfile>(DEFAULT_PROFILE);
   const [isEmojiPickerOpen, setIsEmojiPickerOpen] = useState(false);
+  const [remoteCursorStore] = useState(createRemoteCursorController);
   const socketRef = useRef<Socket | null>(null);
   const shouldSelectCreatedCanvasRef = useRef(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const currentProfileAvatar = useMemo(() => profileAvatar(profile), [profile]);
 
   useEffect(() => {
-    const onPopState = () => setRoomId(currentRoomId());
+    const onPopState = () => {
+      setPath(currentPath());
+      setRoomId(currentRoomId());
+    };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
+
+  const isAdminRoute = path === "/admin";
 
   useEffect(() => {
     if (!roomId) {
@@ -164,13 +296,10 @@ export function App() {
       }
     });
     socket.on("cursor:update", (cursor: RemoteCursor) => {
-      setRemoteCursors((current) => [
-        ...current.filter((item) => item.socketId !== cursor.socketId),
-        cursor
-      ]);
+      remoteCursorStore.update(cursor);
     });
     socket.on("cursor:leave", ({ socketId }: { socketId: string }) => {
-      setRemoteCursors((current) => current.filter((item) => item.socketId !== socketId));
+      remoteCursorStore.leave(socketId);
     });
     socket.on("stroke:preview", (stroke: RemoteStroke) => {
       setRemoteStrokes((current) => {
@@ -232,19 +361,14 @@ export function App() {
     return () => {
       socket.disconnect();
       socketRef.current = null;
-      setRemoteCursors([]);
+      remoteCursorStore.clear();
       setRemoteStrokes([]);
     };
-  }, [roomId]);
+  }, [remoteCursorStore, roomId]);
 
   const activeCanvas = useMemo(
     () => room?.canvases.find((canvas) => canvas.id === activeCanvasId) ?? room?.canvases[0],
     [activeCanvasId, room?.canvases]
-  );
-
-  const activeCanvasCursors = useMemo(
-    () => remoteCursors.filter((cursor) => cursor.canvasId === activeCanvas?.id),
-    [activeCanvas?.id, remoteCursors]
   );
 
   const activeCanvasRemoteStrokes = useMemo(
@@ -274,6 +398,7 @@ export function App() {
   const openNewRoom = useCallback(async () => {
     const snapshot = await createRoom();
     window.history.pushState(null, "", `/r/${snapshot.id}`);
+    setPath(currentPath());
     setRoomId(snapshot.id);
     setRoom(snapshot);
     setActiveCanvasId(snapshot.canvases[0]?.id ?? null);
@@ -309,10 +434,12 @@ export function App() {
         roomId,
         canvasId,
         name: profile.name,
+        color: profile.color,
+        avatar: currentProfileAvatar,
         point
       });
     },
-    [profile.name, roomId]
+    [currentProfileAvatar, profile.color, profile.name, roomId]
   );
 
   const emitCursorLeave = useCallback(() => {
@@ -444,7 +571,7 @@ export function App() {
         )
       };
 
-      setRemoteCursors([]);
+      remoteCursorStore.clear();
       setRemoteStrokes([]);
       const socket = socketRef.current;
       if (socket?.connected) {
@@ -456,7 +583,7 @@ export function App() {
       setRoom(snapshot);
       setActiveCanvasId(snapshot.canvases[0]?.id ?? null);
     },
-    [roomId]
+    [remoteCursorStore, roomId]
   );
 
   useEffect(() => {
@@ -569,6 +696,10 @@ export function App() {
     return () => window.removeEventListener("paste", onPaste);
   }, [activeCanvas, emitOperation, room]);
 
+  if (isAdminRoute) {
+    return <AdminScreen />;
+  }
+
   if (!roomId) {
     return <StartScreen onCreateRoom={openNewRoom} />;
   }
@@ -640,27 +771,28 @@ export function App() {
                 aria-expanded={isEmojiPickerOpen}
                 onClick={() => setIsEmojiPickerOpen((current) => !current)}
               >
-                {profile.name}
+                {renderAvatar(currentProfileAvatar, styles.avatarImage)}
               </button>
               {isEmojiPickerOpen ? (
                 <div className={styles.emojiPopover} role="menu">
                   <div className={styles.emojiGrid}>
-                    {PROFILE_EMOJIS.map((emoji) => (
+                    {PROFILE_CHOICES.map((choice) => (
                       <button
-                        key={emoji}
+                        key={choice.id}
                         className={styles.emojiChoice}
-                        data-active={emoji === profile.name}
+                        data-active={avatarKey(choice.avatar) === avatarKey(currentProfileAvatar)}
                         type="button"
                         role="menuitem"
                         onClick={() => {
                           setProfile((current) => ({
                             ...current,
-                            name: emoji
+                            name: choice.name,
+                            avatar: choice.avatar
                           }));
                           setIsEmojiPickerOpen(false);
                         }}
                       >
-                        {emoji}
+                        {renderAvatar(choice.avatar, styles.avatarImage)}
                       </button>
                     ))}
                   </div>
@@ -774,9 +906,11 @@ export function App() {
             tool={tool}
             color={color}
             size={tool === "pen" ? brushSize : eraserSize}
-            cursors={activeCanvasCursors}
+            cursorStore={remoteCursorStore}
             remoteStrokes={activeCanvasRemoteStrokes}
             localCursorName={profile.name}
+            localCursorAvatar={currentProfileAvatar}
+            localCursorImageSrc={localCursorImageSrc(currentProfileAvatar)}
             onOperation={emitOperation}
             onCursorMove={emitCursorMove}
             onCursorLeave={emitCursorLeave}
@@ -785,6 +919,213 @@ export function App() {
           />
         ) : null}
       </section>
+    </main>
+  );
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) {
+    return `${value} B`;
+  }
+
+  const units = ["KB", "MB", "GB"];
+  let nextValue = value / 1024;
+  let unitIndex = 0;
+  while (nextValue >= 1024 && unitIndex < units.length - 1) {
+    nextValue /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${nextValue.toFixed(nextValue >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+}
+
+function formatDate(value: number): string {
+  return new Intl.DateTimeFormat("ru-RU", {
+    dateStyle: "short",
+    timeStyle: "medium"
+  }).format(value);
+}
+
+function AdminScreen() {
+  const [password, setPassword] = useState(() => sessionStorage.getItem("mathboard-admin-password") ?? "");
+  const [draftPassword, setDraftPassword] = useState("");
+  const [summary, setSummary] = useState<AdminSummary | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+
+  const loadSummary = useCallback(async () => {
+    if (!password) {
+      return;
+    }
+
+    setIsLoading(true);
+    setError(null);
+    try {
+      setSummary(await getAdminSummary(password));
+    } catch {
+      setError("Не удалось загрузить данные администратора");
+    } finally {
+      setIsLoading(false);
+    }
+  }, [password]);
+
+  useEffect(() => {
+    if (!password) {
+      return;
+    }
+
+    void loadSummary();
+    const interval = window.setInterval(() => {
+      void loadSummary();
+    }, 10_000);
+
+    return () => window.clearInterval(interval);
+  }, [loadSummary, password]);
+
+  const submitPassword = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    sessionStorage.setItem("mathboard-admin-password", draftPassword);
+    setPassword(draftPassword);
+    setDraftPassword("");
+  };
+
+  const removeRoom = async (roomId: string) => {
+    if (!window.confirm(`Удалить страницу ${roomId} из памяти приложения?`)) {
+      return;
+    }
+
+    await deleteAdminRoom(roomId, password);
+    await loadSummary();
+  };
+
+  if (!password) {
+    return (
+      <main className={styles.adminShell}>
+        <form className={styles.adminLogin} onSubmit={submitPassword}>
+          <h1>Admin</h1>
+          <input
+            type="password"
+            value={draftPassword}
+            onChange={(event) => setDraftPassword(event.target.value)}
+            placeholder="Пароль"
+            autoFocus
+          />
+          <button className={styles.primaryButton} type="submit" disabled={!draftPassword}>
+            <LogIn size={18} aria-hidden />
+            Войти
+          </button>
+        </form>
+      </main>
+    );
+  }
+
+  return (
+    <main className={styles.adminShell}>
+      <section className={styles.adminHeader}>
+        <div>
+          <h1>Admin</h1>
+          <p>{summary ? `Обновлено: ${formatDate(summary.generatedAt)}` : "Нет данных"}</p>
+        </div>
+        <div className={styles.adminActions}>
+          <button className={styles.actionButton} onClick={() => void loadSummary()} disabled={isLoading}>
+            <RefreshCw size={17} aria-hidden />
+            Обновить
+          </button>
+          <button
+            className={styles.actionButton}
+            onClick={() => {
+              sessionStorage.removeItem("mathboard-admin-password");
+              setPassword("");
+              setSummary(null);
+            }}
+          >
+            Выйти
+          </button>
+        </div>
+      </section>
+
+      {error ? <p className={styles.adminError}>{error}</p> : null}
+
+      {summary ? (
+        <>
+          <section className={styles.adminMetrics}>
+            <div>
+              <span>Страницы</span>
+              <strong>{summary.totals.rooms}</strong>
+            </div>
+            <div>
+              <span>Холсты</span>
+              <strong>{summary.totals.canvases}</strong>
+            </div>
+            <div>
+              <span>Линии</span>
+              <strong>{summary.totals.strokes}</strong>
+            </div>
+            <div>
+              <span>Картинки</span>
+              <strong>{summary.totals.images}</strong>
+            </div>
+            <div>
+              <span>Изображения в памяти</span>
+              <strong>{formatBytes(summary.totals.storedImageBytes)}</strong>
+            </div>
+            <div>
+              <span>RSS</span>
+              <strong>{formatBytes(summary.process.memory.rss)}</strong>
+            </div>
+            <div>
+              <span>Heap</span>
+              <strong>{formatBytes(summary.process.memory.heapUsed)}</strong>
+            </div>
+            <div>
+              <span>CPU</span>
+              <strong>
+                {summary.process.cpu.percent === null
+                  ? "сбор данных"
+                  : `${summary.process.cpu.percent.toFixed(1)}%`}
+              </strong>
+            </div>
+          </section>
+
+          <section className={styles.adminTableWrap}>
+            <table className={styles.adminTable}>
+              <thead>
+                <tr>
+                  <th>Страница</th>
+                  <th>Обновлена</th>
+                  <th>Холсты</th>
+                  <th>Линии</th>
+                  <th>Картинки</th>
+                  <th>История</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {summary.rooms.map((room) => (
+                  <tr key={room.id}>
+                    <td>
+                      <a href={`/r/${room.id}`} target="_blank" rel="noreferrer">
+                        /r/{room.id}
+                        <ExternalLink size={14} aria-hidden />
+                      </a>
+                    </td>
+                    <td>{formatDate(room.updatedAt)}</td>
+                    <td>{room.canvasCount}</td>
+                    <td>{room.strokeCount}</td>
+                    <td>{room.imageCount}</td>
+                    <td>{room.operationCount}</td>
+                    <td>
+                      <button className={styles.dangerButton} onClick={() => void removeRoom(room.id)}>
+                        Удалить
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </section>
+        </>
+      ) : null}
     </main>
   );
 }

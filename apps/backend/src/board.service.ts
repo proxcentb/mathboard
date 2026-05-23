@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
   BoardImage,
   BoardOperation,
+  AdminRoomSummary,
   CanvasSnapshot,
   ClientOperation,
   ImportedRoomSnapshot,
@@ -61,6 +62,65 @@ export class BoardService {
 
     this.rooms.set(id, room);
     return this.toSnapshot(room);
+  }
+
+  listRooms(): AdminRoomSummary[] {
+    return Array.from(this.rooms.values())
+      .map((room) => {
+        const strokeCount = room.canvases.reduce(
+          (sum, canvas) => sum + canvas.strokes.length,
+          0
+        );
+        const imageCount = room.canvases.reduce(
+          (sum, canvas) => sum + canvas.images.length,
+          0
+        );
+        const operationCount = room.canvases.reduce(
+          (sum, canvas) => sum + canvas.history.length + canvas.future.length,
+          0
+        );
+
+        return {
+          id: room.id,
+          updatedAt: room.updatedAt,
+          canvasCount: room.canvases.length,
+          strokeCount,
+          imageCount,
+          operationCount
+        };
+      })
+      .sort((left, right) => right.updatedAt - left.updatedAt);
+  }
+
+  getStoredImageBytes(): number {
+    let bytes = 0;
+    for (const image of this.images.values()) {
+      bytes += image.data.byteLength;
+    }
+    return bytes;
+  }
+
+  deleteRoom(id: string): boolean {
+    const room = this.rooms.get(id);
+    if (!room || !this.rooms.delete(id)) {
+      return false;
+    }
+
+    const deletedImageIds = this.imageIdsForRoom(room);
+    const remainingImageIds = new Set<string>();
+    for (const remainingRoom of this.rooms.values()) {
+      for (const imageId of this.imageIdsForRoom(remainingRoom)) {
+        remainingImageIds.add(imageId);
+      }
+    }
+
+    for (const imageId of deletedImageIds) {
+      if (!remainingImageIds.has(imageId)) {
+        this.images.delete(imageId);
+      }
+    }
+
+    return true;
   }
 
   replaceRoom(roomId: string, snapshot: ImportedRoomSnapshot): RoomSnapshot {
@@ -244,5 +304,23 @@ export class BoardService {
 
   private createReadableId(): string {
     return randomUUID().replace(/-/g, "").slice(0, 12);
+  }
+
+  private imageIdsForRoom(room: RoomState): Set<string> {
+    const ids = new Set<string>();
+    for (const canvas of room.canvases) {
+      for (const image of canvas.images) {
+        const imageId = this.storedImageIdFromSrc(image.src);
+        if (imageId) {
+          ids.add(imageId);
+        }
+      }
+    }
+    return ids;
+  }
+
+  private storedImageIdFromSrc(src: string): string | null {
+    const match = src.match(/\/images\/([^/?#]+)/);
+    return match?.[1] ?? null;
   }
 }

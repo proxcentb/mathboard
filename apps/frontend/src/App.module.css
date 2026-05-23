@@ -183,6 +183,13 @@
   font-size: 1.05rem;
 }
 
+.avatarImage {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  pointer-events: none;
+}
+
 .emojiButton:hover {
   background: var(--surface-muted);
 }
@@ -225,7 +232,7 @@
 
 .emojiGrid {
   display: grid;
-  grid-template-columns: repeat(4, 34px);
+  grid-template-columns: repeat(5, 34px);
   gap: 6px;
 }
 
@@ -370,6 +377,136 @@
 
 .primaryButton:hover {
   background: var(--accent-strong);
+}
+
+.adminShell {
+  min-height: 100vh;
+  padding: 24px;
+  background: #eef1ed;
+}
+
+.adminLogin,
+.adminHeader,
+.adminMetrics,
+.adminTableWrap {
+  width: min(100%, 1120px);
+  margin: 0 auto;
+}
+
+.adminLogin {
+  display: grid;
+  gap: 12px;
+  max-width: 360px;
+  padding-top: 18vh;
+}
+
+.adminLogin h1,
+.adminHeader h1 {
+  margin: 0;
+}
+
+.adminLogin input {
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.adminHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.adminHeader p {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+
+.adminActions {
+  display: flex;
+  gap: 8px;
+}
+
+.adminError {
+  width: min(100%, 1120px);
+  margin: 0 auto 12px;
+  color: #b91c1c;
+}
+
+.adminMetrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.adminMetrics > div {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.adminMetrics span {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.adminMetrics strong {
+  font-size: 1.1rem;
+}
+
+.adminTableWrap {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.adminTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+.adminTable th,
+.adminTable td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.adminTable th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.adminTable a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.dangerButton {
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  color: #b91c1c;
+  background: #fff7f7;
+}
+
+.dangerButton:hover {
+  background: #fee2e2;
 }
 
 @media (max-width: 760px) {

@@ -1,12 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties, Dispatch, SetStateAction } from "react";
 import styles from "./BoardCanvas.module.css";
+import { resolveCursorAvatarSrc } from "../cursorAssets";
 import {
   BoardImage,
   BoardOperation,
   CanvasSnapshot,
   DrawingTool,
+  ParticipantAvatar,
   Point,
   RemoteCursor,
+  RemoteCursorStore,
   RemoteStroke,
   Stroke
 } from "../types";
@@ -22,9 +26,11 @@ interface BoardCanvasProps {
   tool: DrawingTool;
   color: string;
   size: number;
-  cursors: RemoteCursor[];
+  cursorStore: RemoteCursorStore;
   remoteStrokes: RemoteStroke[];
   localCursorName: string;
+  localCursorAvatar: ParticipantAvatar;
+  localCursorImageSrc?: string;
   onOperation: (operation: BoardOperation) => void;
   onCursorMove: (canvasId: string, point: Point) => void;
   onCursorLeave: () => void;
@@ -45,9 +51,11 @@ export function BoardCanvas({
   tool,
   color,
   size,
-  cursors,
+  cursorStore,
   remoteStrokes,
   localCursorName,
+  localCursorAvatar,
+  localCursorImageSrc,
   onOperation,
   onCursorMove,
   onCursorLeave,
@@ -56,6 +64,7 @@ export function BoardCanvas({
 }: BoardCanvasProps) {
   const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const remoteCursorLayerRef = useRef<HTMLDivElement | null>(null);
   const imageCacheRef = useRef(new Map<string, HTMLImageElement>());
   const draftStrokeRef = useRef<Stroke | null>(null);
   const dragRef = useRef<DragState | null>(null);
@@ -70,11 +79,25 @@ export function BoardCanvas({
   const [draftStroke, setDraftStroke] = useState<Stroke | null>(null);
   const [draftImage, setDraftImage] = useState<BoardImage | null>(null);
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
-  const [eraserPoint, setEraserPoint] = useState<Point | null>(null);
-  const [localCursorPoint, setLocalCursorPoint] = useState<Point | null>(null);
   const [lineStart, setLineStart] = useState<Point | null>(null);
   const [linePreviewPoint, setLinePreviewPoint] = useState<Point | null>(null);
   const [isCtrlLineActive, setIsCtrlLineActive] = useState(false);
+  const [canvasScale, setCanvasScale] = useState(1);
+  const [imageCursorUrl, setImageCursorUrl] = useState<string | null>(null);
+
+  const cursorStyle = useMemo<CSSProperties>(
+    () =>
+      createNativeCursorStyle(
+        tool,
+        color,
+        size,
+        canvasScale,
+        localCursorName,
+        localCursorAvatar,
+        imageCursorUrl
+      ),
+    [canvasScale, color, imageCursorUrl, localCursorAvatar, localCursorName, size, tool]
+  );
 
   const drawBase = useCallback(() => {
     resizeCanvasForDisplay(baseCanvasRef.current);
@@ -96,35 +119,19 @@ export function BoardCanvas({
       draftStroke,
       draftImage,
       selectedImageId,
-      tool === "eraser" ? eraserPoint : null,
-      size,
       lineStart && linePreviewPoint ? createLineStroke(lineStart, linePreviewPoint, color, size) : null,
-      cursors,
-      remoteStrokes,
-      localCursorPoint
-        ? {
-            socketId: "local",
-            canvasId: canvas.id,
-            name: localCursorName,
-            point: localCursorPoint
-          }
-        : null
+      remoteStrokes
     );
   }, [
     canvas,
     color,
-    cursors,
     draftImage,
     draftStroke,
-    eraserPoint,
-    localCursorName,
-    localCursorPoint,
     linePreviewPoint,
     lineStart,
     remoteStrokes,
     selectedImageId,
-    size,
-    tool
+    size
   ]);
 
   useEffect(() => {
@@ -235,6 +242,7 @@ export function BoardCanvas({
     const redraw = () => {
       window.cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(() => {
+        updateCanvasScale(overlayCanvasRef.current, setCanvasScale);
         drawBase();
         drawOverlay();
       });
@@ -255,6 +263,140 @@ export function BoardCanvas({
       observer.disconnect();
     };
   }, [drawBase, drawOverlay]);
+
+  useEffect(() => {
+    if (localCursorAvatar.type !== "image" || !localCursorImageSrc) {
+      return;
+    }
+
+    let ignored = false;
+    const cursorColor = tool === "eraser" ? "#0f766e" : color;
+    void createImageCursorUrl(localCursorImageSrc, cursorColor)
+      .then((url) => {
+        if (!ignored) {
+          setImageCursorUrl(url);
+        }
+      })
+      .catch(() => {
+        if (!ignored) {
+          setImageCursorUrl(null);
+        }
+      });
+
+    return () => {
+      ignored = true;
+    };
+  }, [color, localCursorAvatar, localCursorImageSrc, tool]);
+
+  useEffect(() => {
+    const layer = remoteCursorLayerRef.current;
+    if (!layer) {
+      return;
+    }
+
+    const nodes = new Map<string, HTMLDivElement>();
+    const latestCursors = new Map<string, RemoteCursor>();
+    const pendingUpdates = new Map<string, RemoteCursor>();
+    const pendingLeaves = new Set<string>();
+    let frame = 0;
+
+    const removeNode = (socketId: string) => {
+      nodes.get(socketId)?.remove();
+      nodes.delete(socketId);
+    };
+
+    const getNode = (cursor: RemoteCursor) => {
+      let node = nodes.get(cursor.socketId);
+      if (node) {
+        return node;
+      }
+
+      node = document.createElement("div");
+      node.className = styles.remoteCursor;
+      layer.append(node);
+      nodes.set(cursor.socketId, node);
+      return node;
+    };
+
+    const updateNode = (cursor: RemoteCursor) => {
+      if (cursor.canvasId !== canvas.id) {
+        removeNode(cursor.socketId);
+        return;
+      }
+
+      const node = getNode(cursor);
+      updateRemoteCursorAvatar(node, cursor);
+      node.style.setProperty("--cursor-color", cursor.color ?? "#0f766e");
+
+      const rect = layer.getBoundingClientRect();
+      const x = (cursor.point.x / CANVAS_WIDTH) * rect.width;
+      const y = (cursor.point.y / CANVAS_HEIGHT) * rect.height;
+      node.style.transform = `translate3d(${x - 9}px, ${y - 9}px, 0)`;
+    };
+
+    const flush = () => {
+      frame = 0;
+      for (const socketId of pendingLeaves) {
+        removeNode(socketId);
+      }
+      pendingLeaves.clear();
+
+      for (const cursor of pendingUpdates.values()) {
+        updateNode(cursor);
+      }
+      pendingUpdates.clear();
+    };
+
+    const scheduleFlush = () => {
+      if (frame) {
+        return;
+      }
+      frame = window.requestAnimationFrame(flush);
+    };
+
+    const queueUpdate = (cursor: RemoteCursor) => {
+      latestCursors.set(cursor.socketId, cursor);
+      pendingLeaves.delete(cursor.socketId);
+      pendingUpdates.set(cursor.socketId, cursor);
+      scheduleFlush();
+    };
+
+    const queueLeave = (socketId: string) => {
+      latestCursors.delete(socketId);
+      pendingUpdates.delete(socketId);
+      pendingLeaves.add(socketId);
+      scheduleFlush();
+    };
+
+    for (const cursor of cursorStore.getSnapshot()) {
+      queueUpdate(cursor);
+    }
+
+    const unsubscribe = cursorStore.subscribe((event) => {
+      if (event.type === "update") {
+        queueUpdate(event.cursor);
+        return;
+      }
+      queueLeave(event.socketId);
+    });
+
+    const observer = new ResizeObserver(() => {
+      for (const cursor of latestCursors.values()) {
+        pendingUpdates.set(cursor.socketId, cursor);
+      }
+      scheduleFlush();
+    });
+    observer.observe(layer);
+
+    return () => {
+      unsubscribe();
+      observer.disconnect();
+      if (frame) {
+        window.cancelAnimationFrame(frame);
+      }
+      layer.replaceChildren();
+    };
+  }, [canvas.id, cursorStore]);
 
   function scheduleCursorMove(point: Point, immediate = false) {
     pendingCursorPointRef.current = point;
@@ -349,7 +491,6 @@ export function BoardCanvas({
     event.currentTarget.setPointerCapture(event.pointerId);
     const point = pointFromEvent(event);
     pointerPointRef.current = point;
-    setLocalCursorPoint(point);
     scheduleCursorMove(point, true);
     const hit = event.altKey ? findImageHit(canvas.images, point) : null;
 
@@ -387,7 +528,6 @@ export function BoardCanvas({
       return;
     }
 
-    setEraserPoint(tool === "eraser" ? point : null);
     const stroke: Stroke = {
       id: crypto.randomUUID(),
       tool,
@@ -406,9 +546,7 @@ export function BoardCanvas({
   function handlePointerMove(event: React.PointerEvent<HTMLCanvasElement>) {
     const point = pointFromEvent(event);
     pointerPointRef.current = point;
-    setLocalCursorPoint(point);
     scheduleCursorMove(point);
-    setEraserPoint(tool === "eraser" ? point : null);
 
     if (tool === "pen" && lineStart && isCtrlLineActive && !draftStrokeRef.current && !dragRef.current) {
       setLinePreviewPoint(point);
@@ -451,10 +589,6 @@ export function BoardCanvas({
       cursorTimeoutRef.current = null;
     }
     onCursorLeave();
-    setLocalCursorPoint(null);
-    if (!draftStrokeRef.current && !dragRef.current) {
-      setEraserPoint(null);
-    }
     setIsCtrlLineActive(false);
     setLineStart(null);
     setLinePreviewPoint(null);
@@ -512,6 +646,7 @@ export function BoardCanvas({
         <canvas
           ref={overlayCanvasRef}
           className={styles.canvas}
+          style={cursorStyle}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={finishInteraction}
@@ -519,9 +654,58 @@ export function BoardCanvas({
           onPointerLeave={handlePointerLeave}
           aria-label={canvas.title}
         />
+        <div ref={remoteCursorLayerRef} className={styles.remoteCursorLayer} aria-hidden="true" />
       </div>
     </article>
   );
+}
+
+function cursorAvatar(cursor: Pick<RemoteCursor, "avatar" | "name">): ParticipantAvatar {
+  return (
+    cursor.avatar ?? {
+      type: "emoji",
+      value: cursor.name
+    }
+  );
+}
+
+function cursorAvatarKey(avatar: ParticipantAvatar): string {
+  return avatar.type === "emoji" ? `emoji:${avatar.value}` : `image:${avatar.name}`;
+}
+
+function updateRemoteCursorAvatar(node: HTMLDivElement, cursor: RemoteCursor) {
+  const avatar = cursorAvatar(cursor);
+  const key = cursorAvatarKey(avatar);
+  if (node.dataset.avatarKey === key) {
+    return;
+  }
+
+  node.dataset.avatarKey = key;
+  node.replaceChildren();
+
+  if (avatar.type === "emoji") {
+    const name = document.createElement("span");
+    name.className = styles.remoteCursorName;
+    name.textContent = avatar.value;
+    node.append(name);
+    return;
+  }
+
+  const src = resolveCursorAvatarSrc(avatar);
+  if (!src) {
+    const name = document.createElement("span");
+    name.className = styles.remoteCursorName;
+    name.textContent = avatar.alt ?? avatar.name;
+    node.append(name);
+    return;
+  }
+
+  const image = document.createElement("img");
+  image.className = `${styles.remoteCursorName} ${styles.remoteCursorImage}`;
+  image.src = src;
+  image.alt = avatar.alt ?? avatar.name;
+  image.draggable = false;
+  node.append(image);
 }
 
 function drawBaseCanvas(
@@ -561,12 +745,8 @@ function drawOverlayCanvas(
   draftStroke: Stroke | null,
   draftImage: BoardImage | null,
   selectedImageId: string | null,
-  eraserPoint: Point | null,
-  eraserSize: number,
   linePreviewStroke: Stroke | null,
-  cursors: RemoteCursor[],
-  remoteStrokes: RemoteStroke[],
-  localCursor: RemoteCursor | null
+  remoteStrokes: RemoteStroke[]
 ) {
   if (!target) {
     return;
@@ -600,12 +780,8 @@ function drawOverlayCanvas(
           draftStroke,
           draftImage,
           selectedImageId,
-          eraserPoint,
-          eraserSize,
           linePreviewStroke,
-          cursors,
-          remoteStrokes,
-          localCursor
+          remoteStrokes
         )
       );
     }
@@ -620,18 +796,6 @@ function drawOverlayCanvas(
   const selected = images.find((image) => image.id === selectedImageId);
   if (selected) {
     drawSelection(context, selected);
-  }
-
-  if (eraserPoint) {
-    drawEraserPreview(context, eraserPoint, eraserSize);
-  }
-
-  for (const cursor of cursors) {
-    drawRemoteCursor(context, cursor);
-  }
-
-  if (localCursor) {
-    drawRemoteCursor(context, localCursor);
   }
 }
 
@@ -697,6 +861,113 @@ function resizeCanvasForDisplay(target: HTMLCanvasElement | null) {
   context.imageSmoothingEnabled = true;
   context.imageSmoothingQuality = "high";
   context.setTransform(width / CANVAS_WIDTH, 0, 0, height / CANVAS_HEIGHT, 0, 0);
+}
+
+function updateCanvasScale(
+  target: HTMLCanvasElement | null,
+  setScale: Dispatch<SetStateAction<number>>
+) {
+  if (!target) {
+    return;
+  }
+
+  const rect = target.getBoundingClientRect();
+  const nextScale = rect.width / CANVAS_WIDTH;
+  setScale((currentScale) =>
+    Math.abs(currentScale - nextScale) < 0.005 ? currentScale : nextScale
+  );
+}
+
+function createImageCursorUrl(src: string, color: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      const cursorSize = 64;
+      const hotspot = 12;
+      const canvas = document.createElement("canvas");
+      canvas.width = cursorSize;
+      canvas.height = cursorSize;
+      const context = canvas.getContext("2d");
+      if (!context) {
+        reject(new Error("Could not create cursor canvas"));
+        return;
+      }
+
+      context.lineCap = "round";
+      context.strokeStyle = "#ffffff";
+      context.lineWidth = 4;
+      context.beginPath();
+      context.moveTo(hotspot, 3);
+      context.lineTo(hotspot, 21);
+      context.moveTo(3, hotspot);
+      context.lineTo(21, hotspot);
+      context.stroke();
+
+      context.strokeStyle = color;
+      context.lineWidth = 2;
+      context.beginPath();
+      context.moveTo(hotspot, 4);
+      context.lineTo(hotspot, 20);
+      context.moveTo(4, hotspot);
+      context.lineTo(20, hotspot);
+      context.stroke();
+
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "high";
+      context.drawImage(image, 23, 18, 30, 30);
+      resolve(canvas.toDataURL("image/png"));
+    };
+    image.onerror = () => reject(new Error("Could not load cursor image"));
+    image.src = src;
+  });
+}
+
+function createNativeCursorStyle(
+  tool: DrawingTool,
+  color: string,
+  size: number,
+  canvasScale: number,
+  localCursorName: string,
+  localCursorAvatar: ParticipantAvatar,
+  imageCursorUrl: string | null
+): CSSProperties {
+  const visibleSize = clampNumber(size * canvasScale, tool === "eraser" ? 12 : 8, 120);
+  if (localCursorAvatar.type === "image") {
+    const hotspot = 12;
+    return {
+      cursor: imageCursorUrl
+        ? `url("${imageCursorUrl}") ${hotspot} ${hotspot}, crosshair`
+        : "crosshair"
+    };
+  }
+
+  const cursorSize = Math.ceil(clampNumber(visibleSize + 56, 64, 128));
+  const center = Math.round(clampNumber(visibleSize / 2 + 8, 12, 64));
+  const radius = Math.max(2, visibleSize / 2);
+  const lineLength = Math.round(clampNumber(visibleSize / 2 + 7, 8, 18));
+  const label = escapeSvgText(
+    localCursorAvatar.type === "emoji" ? localCursorAvatar.value : localCursorName
+  );
+  const svg =
+    tool === "eraser"
+      ? `<svg xmlns="http://www.w3.org/2000/svg" width="${cursorSize}" height="${cursorSize}" viewBox="0 0 ${cursorSize} ${cursorSize}"><circle cx="${center}" cy="${center}" r="${Math.min(radius, center - 3)}" fill="rgba(255,255,255,.78)" stroke="#0f766e" stroke-width="2"/><circle cx="${center}" cy="${center}" r="1.5" fill="#0f766e"/><text x="${center + 13}" y="${center + 18}" font-size="18" font-family="system-ui, Apple Color Emoji, Segoe UI Emoji, sans-serif" fill="#17201f" stroke="#ffffff" stroke-width="3" paint-order="stroke">${label}</text></svg>`
+      : `<svg xmlns="http://www.w3.org/2000/svg" width="${cursorSize}" height="${cursorSize}" viewBox="0 0 ${cursorSize} ${cursorSize}"><path d="M${center} ${center - lineLength}V${center + lineLength}M${center - lineLength} ${center}H${center + lineLength}" stroke="white" stroke-width="4" stroke-linecap="round"/><path d="M${center} ${center - lineLength}V${center + lineLength}M${center - lineLength} ${center}H${center + lineLength}" stroke="${color}" stroke-width="2" stroke-linecap="round"/><circle cx="${center}" cy="${center}" r="${Math.min(radius, lineLength - 2)}" fill="none" stroke="${color}" stroke-width="1.5"/><text x="${center + 13}" y="${center + 18}" font-size="18" font-family="system-ui, Apple Color Emoji, Segoe UI Emoji, sans-serif" fill="#17201f" stroke="#ffffff" stroke-width="3" paint-order="stroke">${label}</text></svg>`;
+
+  return {
+    cursor: `url("data:image/svg+xml,${encodeURIComponent(svg)}") ${center} ${center}, crosshair`
+  };
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function escapeSvgText(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
 function drawGrid(context: CanvasRenderingContext2D, width: number, height: number) {
@@ -804,48 +1075,6 @@ function drawSelection(context: CanvasRenderingContext2D, image: BoardImage) {
     HANDLE_SIZE,
     HANDLE_SIZE
   );
-  context.restore();
-}
-
-function drawEraserPreview(context: CanvasRenderingContext2D, point: Point, size: number) {
-  context.save();
-  context.beginPath();
-  context.arc(point.x, point.y, Math.max(1, size / 2), 0, Math.PI * 2);
-  context.fillStyle = "rgba(15, 118, 110, 0.08)";
-  context.strokeStyle = "#0f766e";
-  context.lineWidth = 1.5;
-  context.fill();
-  context.stroke();
-  context.restore();
-}
-
-function drawRemoteCursor(context: CanvasRenderingContext2D, cursor: RemoteCursor) {
-  context.save();
-  context.translate(cursor.point.x, cursor.point.y);
-
-  context.lineCap = "round";
-  context.strokeStyle = "#ffffff";
-  context.lineWidth = 4;
-  context.beginPath();
-  context.moveTo(-9, 0);
-  context.lineTo(9, 0);
-  context.moveTo(0, -9);
-  context.lineTo(0, 9);
-  context.stroke();
-
-  context.strokeStyle = "#0f766e";
-  context.lineWidth = 2;
-  context.beginPath();
-  context.moveTo(-8, 0);
-  context.lineTo(8, 0);
-  context.moveTo(0, -8);
-  context.lineTo(0, 8);
-  context.stroke();
-
-  context.font = "18px system-ui, sans-serif";
-  context.textBaseline = "middle";
-  context.fillStyle = "#17201f";
-  context.fillText(cursor.name, 12, 14);
   context.restore();
 }
 

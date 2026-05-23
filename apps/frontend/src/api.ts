@@ -1,4 +1,4 @@
-import { BoardOperation, ImportedRoomSnapshot, RoomSnapshot } from "./types";
+import { AdminSummary, BoardOperation, ImportedRoomSnapshot, RoomSnapshot } from "./types";
 
 export const API_URL = import.meta.env.VITE_API_URL ?? "/api";
 export const SOCKET_URL = import.meta.env.VITE_SOCKET_URL ?? "";
@@ -78,4 +78,31 @@ export async function uploadImage(dataUrl: string): Promise<{ src: string }> {
   return {
     src: apiPath(`/images/${id}`)
   };
+}
+
+export async function getAdminSummary(password: string): Promise<AdminSummary> {
+  const response = await fetch(apiPath("/admin/summary"), {
+    headers: {
+      "X-Admin-Password": password
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error("Could not load admin summary");
+  }
+
+  return response.json() as Promise<AdminSummary>;
+}
+
+export async function deleteAdminRoom(id: string, password: string): Promise<void> {
+  const response = await fetch(apiPath(`/admin/rooms/${id}`), {
+    method: "DELETE",
+    headers: {
+      "X-Admin-Password": password
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error("Could not delete room");
+  }
 }

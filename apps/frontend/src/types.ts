@@ -37,6 +37,43 @@ export interface RoomSnapshot {
   updatedAt: number;
 }
 
+export interface AdminRoomSummary {
+  id: string;
+  updatedAt: number;
+  canvasCount: number;
+  strokeCount: number;
+  imageCount: number;
+  operationCount: number;
+}
+
+export interface AdminSummary {
+  generatedAt: number;
+  rooms: AdminRoomSummary[];
+  totals: {
+    rooms: number;
+    canvases: number;
+    strokes: number;
+    images: number;
+    storedImageBytes: number;
+  };
+  process: {
+    pid: number;
+    uptimeSeconds: number;
+    memory: {
+      rss: number;
+      heapTotal: number;
+      heapUsed: number;
+      external: number;
+      arrayBuffers: number;
+    };
+    cpu: {
+      userSeconds: number;
+      systemSeconds: number;
+      percent: number | null;
+    };
+  };
+}
+
 export interface ImportedCanvasSnapshot {
   id: string;
   title: string;
@@ -59,7 +96,24 @@ export interface RemoteCursor {
   socketId: string;
   canvasId: string;
   name: string;
+  color?: string;
+  avatar?: ParticipantAvatar;
   point: Point;
+}
+
+export type RemoteCursorEvent =
+  | {
+      type: "update";
+      cursor: RemoteCursor;
+    }
+  | {
+      type: "leave";
+      socketId: string;
+    };
+
+export interface RemoteCursorStore {
+  getSnapshot: () => RemoteCursor[];
+  subscribe: (listener: (event: RemoteCursorEvent) => void) => () => void;
 }
 
 export interface RemoteStroke {
@@ -73,7 +127,20 @@ export interface ParticipantProfile {
   slot: number;
   name: string;
   color: string;
+  avatar?: ParticipantAvatar;
 }
+
+export type ParticipantAvatar =
+  | {
+      type: "emoji";
+      value: string;
+    }
+  | {
+      type: "image";
+      name: string;
+      src?: string;
+      alt?: string;
+    };
 
 export type BoardOperation =
   | {
