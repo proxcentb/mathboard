@@ -7,6 +7,10 @@ function apiPath(path: string): string {
   return `${API_URL.replace(/\/$/, "")}${path}`;
 }
 
+export function imageUrl(id: string): string {
+  return apiPath(`/images/${encodeURIComponent(id)}`);
+}
+
 export async function createRoom(): Promise<RoomSnapshot> {
   const response = await fetch(apiPath("/rooms"), {
     method: "POST"
@@ -61,7 +65,7 @@ export async function importRoom(roomId: string, snapshot: ImportedRoomSnapshot)
   return response.json() as Promise<RoomSnapshot>;
 }
 
-export async function uploadImage(dataUrl: string): Promise<{ src: string }> {
+export async function uploadImage(dataUrl: string): Promise<{ id: string; src: string }> {
   const response = await fetch(apiPath("/images"), {
     method: "POST",
     headers: {
@@ -76,7 +80,8 @@ export async function uploadImage(dataUrl: string): Promise<{ src: string }> {
 
   const { id } = (await response.json()) as { id: string };
   return {
-    src: apiPath(`/images/${id}`)
+    id,
+    src: imageUrl(id)
   };
 }
 

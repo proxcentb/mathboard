@@ -11,10 +11,14 @@ import { Server, Socket } from "socket.io";
 import { BoardService } from "./board.service";
 import {
   BroadcastOperation,
+  CanvasSnapshot,
+  ClientBoardOperation,
   ClientOperationMessage,
   CursorLeaveMessage,
+  CursorProfileUpdateMessage,
   CursorUpdateMessage,
   JoinRoomMessage,
+  ImagePlacement,
   ParticipantProfile,
   ReplaceRoomMessage,
   StrokeEndMessage,
@@ -49,6 +53,7 @@ export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   private readonly participants = new Map<string, Map<string, ParticipantProfile>>();
   private readonly socketRooms = new Map<string, Set<string>>();
+  private readonly socketUserIds = new Map<string, string>();
 
   constructor(private readonly boardService: BoardService) {}
 
@@ -61,20 +66,40 @@ export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
       client.broadcast.to(roomId).emit("cursor:leave", {
         socketId: client.id
       });
+      client.broadcast.to(roomId).emit("cursor:profile:leave", {
+        socketId: client.id
+      });
       client.broadcast.to(roomId).emit("stroke:end", {
         socketId: client.id
       });
       this.participants.get(roomId)?.delete(client.id);
     }
     this.socketRooms.delete(client.id);
+    this.socketUserIds.delete(client.id);
   }
 
   @SubscribeMessage("room:join")
   joinRoom(@ConnectedSocket() client: Socket, @MessageBody() payload: JoinRoomMessage): void {
     client.join(payload.roomId);
     this.trackRoom(client.id, payload.roomId);
-    client.emit("room:profile", this.assignProfile(payload.roomId, client.id));
-    client.emit("room:snapshot", this.boardService.getOrCreateRoom(payload.roomId));
+    this.socketUserIds.set(client.id, payload.userId);
+    const profile = this.assignProfile(payload.roomId, client.id);
+    const snapshot = this.boardService.getOrCreateRoom(payload.roomId, payload.userId);
+    client.emit("room:role", {
+      isAdmin: this.boardService.claimRoomAdmin(payload.roomId, payload.userId)
+    });
+    client.emit("room:profile", profile);
+    client.emit("room:snapshot", snapshot);
+
+    for (const [socketId, participant] of this.participants.get(payload.roomId) ?? []) {
+      if (socketId !== client.id) {
+        client.emit("cursor:profile:update", { socketId, ...participant });
+      }
+    }
+    client.broadcast.to(payload.roomId).emit("cursor:profile:update", {
+      socketId: client.id,
+      ...profile
+    });
   }
 
   @SubscribeMessage("room:operation")
@@ -83,10 +108,15 @@ export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() payload: ClientOperationMessage
   ): void {
     const operation = payload.operation;
-    const snapshot = this.boardService.applyClientOperation(payload.roomId, operation);
+    const userId = this.socketUserIds.get(client.id) ?? client.id;
+    const snapshot = this.boardService.applyClientOperation(payload.roomId, userId, operation);
 
-    if (operation.type === "canvas:create") {
-      this.server.to(payload.roomId).emit("room:snapshot", snapshot);
+    if (
+      operation.type === "canvas:create" ||
+      operation.type === "canvas:move" ||
+      operation.type === "canvas:delete"
+    ) {
+      void this.emitRoomSnapshots(payload.roomId);
       return;
     }
 
@@ -94,25 +124,24 @@ export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
       operation.type === "history:undo" ||
       operation.type === "history:redo"
     ) {
-      this.server.to(payload.roomId).emit("room:snapshot", snapshot);
-      return;
-    }
+      const canvas = snapshot.canvases.find((item) => item.id === operation.canvasId);
+      if (!canvas) {
+        return;
+      }
 
-    const canvas = snapshot.canvases.find((item) => item.id === operation.canvasId);
-    if (!canvas) {
+      void this.emitCanvasSnapshot(payload.roomId, userId, snapshot.updatedAt, canvas);
       return;
     }
 
     client.broadcast.to(payload.roomId).emit("room:operation:applied", {
       socketId: client.id,
       operation: this.toBroadcastOperation(operation),
-      updatedAt: snapshot.updatedAt,
-      canvas: {
-        id: canvas.id,
-        canUndo: canvas.canUndo,
-        canRedo: canvas.canRedo
-      }
+      updatedAt: snapshot.updatedAt
     });
+    const canvas = snapshot.canvases.find((item) => item.id === operation.canvasId);
+    if (canvas) {
+      void this.emitHistoryState(payload.roomId, userId, canvas);
+    }
   }
 
   @SubscribeMessage("room:replace")
@@ -129,10 +158,26 @@ export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
     client.broadcast.to(payload.roomId).emit("cursor:update", {
       socketId: client.id,
       canvasId: payload.canvasId,
+      point: payload.point
+    });
+  }
+
+  @SubscribeMessage("cursor:profile:update")
+  updateCursorProfile(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: CursorProfileUpdateMessage
+  ): void {
+    const profile = this.assignProfile(payload.roomId, client.id);
+    const nextProfile = {
+      ...profile,
       name: payload.name,
       color: payload.color,
-      avatar: payload.avatar,
-      point: payload.point
+      avatar: payload.avatar
+    };
+    this.participants.get(payload.roomId)?.set(client.id, nextProfile);
+    client.broadcast.to(payload.roomId).emit("cursor:profile:update", {
+      socketId: client.id,
+      ...nextProfile
     });
   }
 
@@ -201,14 +246,90 @@ export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.socketRooms.set(socketId, rooms);
   }
 
-  private toBroadcastOperation(operation: BroadcastOperation): BroadcastOperation {
-    if (operation.type !== "canvas:clear") {
+  private async emitRoomSnapshots(roomId: string): Promise<void> {
+    const sockets = await this.server.in(roomId).fetchSockets();
+    for (const socket of sockets) {
+      socket.emit(
+        "room:snapshot",
+        this.boardService.getOrCreateRoom(roomId, this.socketUserIds.get(socket.id))
+      );
+    }
+  }
+
+  private toBroadcastOperation(operation: ClientBoardOperation): BroadcastOperation {
+    if (operation.type === "stroke:add") {
       return operation;
     }
 
+    if (operation.type === "canvas:clear") {
+      return {
+        type: operation.type,
+        canvasId: operation.canvasId
+      };
+    }
+
+    if (operation.type === "image:delete") {
+      return {
+        type: operation.type,
+        canvasId: operation.canvasId,
+        imageId: operation.imageId
+      };
+    }
+
     return {
-      type: "canvas:clear",
-      canvasId: operation.canvasId
+      type: operation.type,
+      canvasId: operation.canvasId,
+      image: this.toImagePlacement(operation.image)
     };
+  }
+
+  private toImagePlacement(image: ImagePlacement): ImagePlacement {
+    return {
+      id: image.id,
+      x: image.x,
+      y: image.y,
+      width: image.width,
+      height: image.height
+    };
+  }
+
+  private async emitCanvasSnapshot(
+    roomId: string,
+    userId: string,
+    updatedAt: number,
+    canvas: CanvasSnapshot
+  ): Promise<void> {
+    const sockets = await this.server.in(roomId).fetchSockets();
+    for (const socket of sockets) {
+      socket.emit("room:canvas:snapshot", {
+        updatedAt,
+        canvas:
+          this.socketUserIds.get(socket.id) === userId
+            ? canvas
+            : {
+                id: canvas.id,
+                title: canvas.title,
+                strokes: canvas.strokes,
+                images: canvas.images
+              }
+      });
+    }
+  }
+
+  private async emitHistoryState(
+    roomId: string,
+    userId: string,
+    canvas: CanvasSnapshot
+  ): Promise<void> {
+    const sockets = await this.server.in(roomId).fetchSockets();
+    for (const socket of sockets) {
+      if (this.socketUserIds.get(socket.id) === userId) {
+        socket.emit("room:history:state", {
+          canvasId: canvas.id,
+          canUndo: canvas.canUndo,
+          canRedo: canvas.canRedo
+        });
+      }
+    }
   }
 }

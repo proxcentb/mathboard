@@ -219,7 +219,7 @@ export function BoardCanvas({
       onOperation({
         type: "image:delete",
         canvasId: canvas.id,
-        image: selectedImage
+        imageId: selectedImage.id
       });
       setSelectedImageId(null);
       setDraftImage(null);
@@ -604,8 +604,7 @@ export function BoardCanvas({
         onOperation({
           type: "image:update",
           canvasId: canvas.id,
-          before: drag.before,
-          after
+          image: imagePlacement(after)
         });
       }
       return;
@@ -1125,4 +1124,14 @@ function hasImageChanged(before: BoardImage, after: BoardImage): boolean {
     before.width !== after.width ||
     before.height !== after.height
   );
+}
+
+function imagePlacement(image: BoardImage) {
+  return {
+    id: image.id,
+    x: image.x,
+    y: image.y,
+    width: image.width,
+    height: image.height
+  };
 }

@@ -1,5 +1,7 @@
 import * as Toolbar from "@radix-ui/react-toolbar";
 import {
+  ArrowDown,
+  ArrowUp,
   Brush,
   Copy,
   Download,
@@ -22,8 +24,8 @@ import {
   deleteAdminRoom,
   getAdminSummary,
   getRoom,
+  imageUrl,
   importRoom,
-  sendOperation,
   uploadImage
 } from "./api";
 import styles from "./App.module.css";
@@ -34,7 +36,9 @@ import {
   BoardImage,
   BoardOperation,
   AdminSummary,
+  CanvasSnapshotMessage,
   DrawingTool,
+  HistoryStateMessage,
   ImportedRoomSnapshot,
   MathboardExportFile,
   OperationAppliedMessage,
@@ -43,8 +47,11 @@ import {
   Point,
   RemoteCursor,
   RemoteCursorEvent,
+  RemoteCursorPosition,
+  RemoteCursorProfile,
   RemoteCursorStore,
   RemoteStroke,
+  RoomRoleMessage,
   RoomSnapshot,
   Stroke
 } from "./types";
@@ -73,14 +80,117 @@ const PROFILE_CHOICES = [
 const MIN_TOOL_SIZE = 1;
 const MAX_BRUSH_SIZE = 48;
 const MAX_ERASER_SIZE = 120;
+const USER_ID_STORAGE_KEY = "mathboard-user-id";
+
+interface RoomPreferences {
+  cursorName: string;
+  cursorAvatar?: ParticipantAvatar;
+  color: string;
+  tool: DrawingTool;
+  brushSize: number;
+  eraserSize: number;
+}
+
+const DEFAULT_ROOM_PREFERENCES: RoomPreferences = {
+  cursorName: DEFAULT_PROFILE.name,
+  color: DEFAULT_PROFILE.color,
+  tool: "pen",
+  brushSize: 1,
+  eraserSize: 50
+};
 
 function currentRoomId(): string | null {
-  const match = window.location.pathname.match(/^\/r\/([^/]+)$/);
+  const match = window.location.pathname.match(/^\/r\/([^/]+)(?:\/c\/([^/]+))?\/?$/);
   return match?.[1] ?? null;
+}
+
+function currentCanvasId(): string | null {
+  const match = window.location.pathname.match(/^\/r\/([^/]+)(?:\/c\/([^/]+))?\/?$/);
+  return match?.[2] ?? null;
 }
 
 function currentPath(): string {
   return window.location.pathname;
+}
+
+function roomCanvasPath(roomId: string, canvasId: string): string {
+  return `/r/${encodeURIComponent(roomId)}/c/${encodeURIComponent(canvasId)}`;
+}
+
+function getOrCreateUserId(): string {
+  const existing = localStorage.getItem(USER_ID_STORAGE_KEY);
+  if (existing) {
+    return existing;
+  }
+
+  const userId = crypto.randomUUID();
+  localStorage.setItem(USER_ID_STORAGE_KEY, userId);
+  return userId;
+}
+
+function roomPreferencesStorageKey(userId: string, roomId: string): string {
+  return `mathboard-user:${userId}:room:${roomId}:preferences`;
+}
+
+function readRoomPreferences(userId: string, roomId: string | null): RoomPreferences | null {
+  if (!roomId) {
+    return null;
+  }
+
+  const content = localStorage.getItem(roomPreferencesStorageKey(userId, roomId));
+  if (!content) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(content) as Partial<RoomPreferences>;
+    return {
+      cursorName:
+        typeof parsed.cursorName === "string"
+          ? parsed.cursorName
+          : DEFAULT_ROOM_PREFERENCES.cursorName,
+      cursorAvatar: isParticipantAvatar(parsed.cursorAvatar) ? parsed.cursorAvatar : undefined,
+      color: typeof parsed.color === "string" ? parsed.color : DEFAULT_ROOM_PREFERENCES.color,
+      tool: parsed.tool === "eraser" ? "eraser" : "pen",
+      brushSize: clampNumber(parsed.brushSize, MIN_TOOL_SIZE, MAX_BRUSH_SIZE, 1),
+      eraserSize: clampNumber(parsed.eraserSize, MIN_TOOL_SIZE, MAX_ERASER_SIZE, 50)
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeRoomPreferences(userId: string, roomId: string, preferences: RoomPreferences): void {
+  localStorage.setItem(roomPreferencesStorageKey(userId, roomId), JSON.stringify(preferences));
+}
+
+function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? clamp(value, min, max)
+    : fallback;
+}
+
+function isParticipantAvatar(value: unknown): value is ParticipantAvatar {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const avatar = value as Partial<ParticipantAvatar>;
+  return avatar.type === "emoji"
+    ? typeof avatar.value === "string"
+    : avatar.type === "image" && typeof avatar.name === "string";
+}
+
+function profileWithPreferences(
+  profile: ParticipantProfile,
+  preferences: RoomPreferences
+): ParticipantProfile {
+  return {
+    ...profile,
+    name: preferences.cursorName,
+    avatar: preferences.cursorAvatar,
+    color: preferences.color
+  };
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -156,13 +266,16 @@ function localCursorImageSrc(avatar: ParticipantAvatar): string | undefined {
 }
 
 interface RemoteCursorController extends RemoteCursorStore {
-  update: (cursor: RemoteCursor) => void;
+  updatePosition: (position: RemoteCursorPosition) => void;
+  updateProfile: (profile: RemoteCursorProfile) => void;
+  removeProfile: (socketId: string) => void;
   leave: (socketId: string) => void;
   clear: () => void;
 }
 
 function createRemoteCursorController(): RemoteCursorController {
   const cursors = new Map<string, RemoteCursor>();
+  const profiles = new Map<string, RemoteCursorProfile>();
   const listeners = new Set<(event: RemoteCursorEvent) => void>();
 
   function emit(event: RemoteCursorEvent) {
@@ -179,9 +292,32 @@ function createRemoteCursorController(): RemoteCursorController {
         listeners.delete(listener);
       };
     },
-    update: (cursor) => {
+    updatePosition: (position) => {
+      const profile = profiles.get(position.socketId);
+      const cursor = {
+        name: profile?.name ?? "?",
+        color: profile?.color,
+        avatar: profile?.avatar,
+        ...position
+      };
       cursors.set(cursor.socketId, cursor);
       emit({ type: "update", cursor });
+    },
+    updateProfile: (profile) => {
+      profiles.set(profile.socketId, profile);
+      const cursor = cursors.get(profile.socketId);
+      if (!cursor) {
+        return;
+      }
+
+      const updatedCursor = {
+        ...cursor,
+        name: profile.name,
+        color: profile.color,
+        avatar: profile.avatar
+      };
+      cursors.set(profile.socketId, updatedCursor);
+      emit({ type: "update", cursor: updatedCursor });
     },
     leave: (socketId) => {
       if (!cursors.delete(socketId)) {
@@ -189,9 +325,13 @@ function createRemoteCursorController(): RemoteCursorController {
       }
       emit({ type: "leave", socketId });
     },
+    removeProfile: (socketId) => {
+      profiles.delete(socketId);
+    },
     clear: () => {
       const socketIds = Array.from(cursors.keys());
       cursors.clear();
+      profiles.clear();
       for (const socketId of socketIds) {
         emit({ type: "leave", socketId });
       }
@@ -200,27 +340,44 @@ function createRemoteCursorController(): RemoteCursorController {
 }
 
 export function App() {
+  const [userId] = useState(getOrCreateUserId);
   const [path, setPath] = useState(() => currentPath());
   const [roomId, setRoomId] = useState(() => currentRoomId());
+  const [initialPreferences] = useState(() => readRoomPreferences(userId, currentRoomId()));
+  const initialProfile = initialPreferences
+    ? profileWithPreferences(DEFAULT_PROFILE, initialPreferences)
+    : DEFAULT_PROFILE;
   const [room, setRoom] = useState<RoomSnapshot | null>(null);
-  const [tool, setTool] = useState<DrawingTool>("pen");
-  const [color, setColor] = useState("#1d4ed8");
-  const [brushSize, setBrushSize] = useState(1);
-  const [eraserSize, setEraserSize] = useState(50);
-  const [activeCanvasId, setActiveCanvasId] = useState<string | null>(null);
+  const [adminRoomId, setAdminRoomId] = useState<string | null>(null);
+  const [tool, setTool] = useState<DrawingTool>(
+    initialPreferences?.tool ?? DEFAULT_ROOM_PREFERENCES.tool
+  );
+  const [color, setColor] = useState(
+    initialPreferences?.color ?? DEFAULT_ROOM_PREFERENCES.color
+  );
+  const [brushSize, setBrushSize] = useState(
+    initialPreferences?.brushSize ?? DEFAULT_ROOM_PREFERENCES.brushSize
+  );
+  const [eraserSize, setEraserSize] = useState(
+    initialPreferences?.eraserSize ?? DEFAULT_ROOM_PREFERENCES.eraserSize
+  );
+  const [activeCanvasId, setActiveCanvasId] = useState(() => currentCanvasId());
   const [remoteStrokes, setRemoteStrokes] = useState<RemoteStroke[]>([]);
-  const [profile, setProfile] = useState<ParticipantProfile>(DEFAULT_PROFILE);
+  const [profile, setProfile] = useState<ParticipantProfile>(initialProfile);
   const [isEmojiPickerOpen, setIsEmojiPickerOpen] = useState(false);
   const [remoteCursorStore] = useState(createRemoteCursorController);
   const socketRef = useRef<Socket | null>(null);
   const shouldSelectCreatedCanvasRef = useRef(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const colorInputRef = useRef<HTMLInputElement | null>(null);
+  const preferencesRoomIdRef = useRef<string | null>(null);
   const currentProfileAvatar = useMemo(() => profileAvatar(profile), [profile]);
 
   useEffect(() => {
     const onPopState = () => {
       setPath(currentPath());
       setRoomId(currentRoomId());
+      setActiveCanvasId(currentCanvasId());
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -237,7 +394,11 @@ export function App() {
     void getRoom(roomId).then((snapshot) => {
       if (!ignored) {
         setRoom(snapshot);
-        setActiveCanvasId((current) => current ?? snapshot.canvases[0]?.id ?? null);
+        setActiveCanvasId((current) =>
+          snapshot.canvases.some((canvas) => canvas.id === current)
+            ? current
+            : snapshot.canvases[0]?.id ?? null
+        );
       }
     });
 
@@ -245,6 +406,17 @@ export function App() {
       ignored = true;
     };
   }, [roomId]);
+
+  useEffect(() => {
+    if (!roomId || !activeCanvasId) {
+      return;
+    }
+
+    const nextPath = roomCanvasPath(roomId, activeCanvasId);
+    if (window.location.pathname !== nextPath) {
+      window.history.replaceState(null, "", nextPath);
+    }
+  }, [activeCanvasId, roomId]);
 
   useEffect(() => {
     if (!roomId) {
@@ -258,11 +430,31 @@ export function App() {
 
     socketRef.current = socket;
     socket.on("connect", () => {
-      socket.emit("room:join", { roomId });
+      socket.emit("room:join", { roomId, userId });
     });
     socket.on("room:profile", (nextProfile: ParticipantProfile) => {
-      setProfile(nextProfile);
-      setColor(nextProfile.color);
+      const preferences = readRoomPreferences(userId, roomId);
+      const restoredProfile = preferences
+        ? profileWithPreferences(nextProfile, preferences)
+        : nextProfile;
+      preferencesRoomIdRef.current = roomId;
+      setProfile(restoredProfile);
+      setColor(restoredProfile.color);
+      setTool(preferences?.tool ?? DEFAULT_ROOM_PREFERENCES.tool);
+      setBrushSize(preferences?.brushSize ?? DEFAULT_ROOM_PREFERENCES.brushSize);
+      setEraserSize(preferences?.eraserSize ?? DEFAULT_ROOM_PREFERENCES.eraserSize);
+
+      if (preferences) {
+        socket.emit("cursor:profile:update", {
+          roomId,
+          name: restoredProfile.name,
+          color: restoredProfile.color,
+          avatar: restoredProfile.avatar
+        });
+      }
+    });
+    socket.on("room:role", ({ isAdmin }: RoomRoleMessage) => {
+      setAdminRoomId(isAdmin ? roomId : null);
     });
     socket.on("room:snapshot", (snapshot: RoomSnapshot) => {
       setRoom(snapshot);
@@ -280,6 +472,12 @@ export function App() {
         return snapshot.canvases[0]?.id ?? null;
       });
     });
+    socket.on("room:canvas:snapshot", (message: CanvasSnapshotMessage) => {
+      setRoom((current) => applyCanvasSnapshot(current, message));
+    });
+    socket.on("room:history:state", (message: HistoryStateMessage) => {
+      setRoom((current) => applyHistoryState(current, message));
+    });
     socket.on("room:operation:applied", (message: OperationAppliedMessage) => {
       setRoom((current) => applyBroadcastOperation(current, message));
 
@@ -295,11 +493,17 @@ export function App() {
         );
       }
     });
-    socket.on("cursor:update", (cursor: RemoteCursor) => {
-      remoteCursorStore.update(cursor);
+    socket.on("cursor:update", (position: RemoteCursorPosition) => {
+      remoteCursorStore.updatePosition(position);
+    });
+    socket.on("cursor:profile:update", (nextProfile: RemoteCursorProfile) => {
+      remoteCursorStore.updateProfile(nextProfile);
     });
     socket.on("cursor:leave", ({ socketId }: { socketId: string }) => {
       remoteCursorStore.leave(socketId);
+    });
+    socket.on("cursor:profile:leave", ({ socketId }: { socketId: string }) => {
+      remoteCursorStore.removeProfile(socketId);
     });
     socket.on("stroke:preview", (stroke: RemoteStroke) => {
       setRemoteStrokes((current) => {
@@ -361,15 +565,35 @@ export function App() {
     return () => {
       socket.disconnect();
       socketRef.current = null;
+      if (preferencesRoomIdRef.current === roomId) {
+        preferencesRoomIdRef.current = null;
+      }
       remoteCursorStore.clear();
       setRemoteStrokes([]);
     };
-  }, [remoteCursorStore, roomId]);
+  }, [remoteCursorStore, roomId, userId]);
+
+  useEffect(() => {
+    const preferencesRoomId = preferencesRoomIdRef.current;
+    if (!preferencesRoomId) {
+      return;
+    }
+
+    writeRoomPreferences(userId, preferencesRoomId, {
+      cursorName: profile.name,
+      cursorAvatar: profile.avatar,
+      color,
+      tool,
+      brushSize,
+      eraserSize
+    });
+  }, [brushSize, color, eraserSize, profile.avatar, profile.name, tool, userId]);
 
   const activeCanvas = useMemo(
     () => room?.canvases.find((canvas) => canvas.id === activeCanvasId) ?? room?.canvases[0],
     [activeCanvasId, room?.canvases]
   );
+  const canManageCanvases = adminRoomId === roomId;
 
   const activeCanvasRemoteStrokes = useMemo(
     () => remoteStrokes.filter((stroke) => stroke.canvasId === activeCanvas?.id),
@@ -383,25 +607,19 @@ export function App() {
       }
 
       setRoom((current) => applyOptimisticOperation(current, operation));
-
-      const socket = socketRef.current;
-      if (socket?.connected) {
-        socket.emit("room:operation", { roomId, operation });
-        return;
-      }
-
-      void sendOperation(roomId, operation).then(setRoom);
+      socketRef.current?.emit("room:operation", { roomId, operation });
     },
     [roomId]
   );
 
   const openNewRoom = useCallback(async () => {
     const snapshot = await createRoom();
-    window.history.pushState(null, "", `/r/${snapshot.id}`);
+    const canvasId = snapshot.canvases[0]?.id ?? null;
+    window.history.pushState(null, "", canvasId ? roomCanvasPath(snapshot.id, canvasId) : `/r/${snapshot.id}`);
     setPath(currentPath());
     setRoomId(snapshot.id);
     setRoom(snapshot);
-    setActiveCanvasId(snapshot.canvases[0]?.id ?? null);
+    setActiveCanvasId(canvasId);
   }, []);
 
   const addCanvas = useCallback(() => {
@@ -413,16 +631,42 @@ export function App() {
     const operation: BoardOperation = { type: "canvas:create" };
     const socket = socketRef.current;
 
-    if (socket?.connected) {
-      socket.emit("room:operation", { roomId, operation });
-      return;
-    }
-
-    void sendOperation(roomId, operation).then((snapshot) => {
-      setRoom(snapshot);
-      setActiveCanvasId(snapshot.canvases.at(-1)?.id ?? null);
-    });
+    socket?.emit("room:operation", { roomId, operation });
   }, [roomId]);
+
+  const moveCanvas = useCallback(
+    (canvasId: string, toIndex: number) => {
+      if (!canManageCanvases) {
+        return;
+      }
+
+      emitOperation({
+        type: "canvas:move",
+        canvasId,
+        toIndex
+      });
+    },
+    [canManageCanvases, emitOperation]
+  );
+
+  const deleteCanvas = useCallback(
+    (canvasId: string) => {
+      if (
+        !canManageCanvases ||
+        !room ||
+        room.canvases.length === 1 ||
+        !window.confirm("Удалить холст для всех участников?")
+      ) {
+        return;
+      }
+
+      emitOperation({
+        type: "canvas:delete",
+        canvasId
+      });
+    },
+    [canManageCanvases, emitOperation, room]
+  );
 
   const emitCursorMove = useCallback(
     (canvasId: string, point: Point) => {
@@ -433,14 +677,48 @@ export function App() {
       socketRef.current?.emit("cursor:update", {
         roomId,
         canvasId,
-        name: profile.name,
-        color: profile.color,
-        avatar: currentProfileAvatar,
         point
       });
     },
-    [currentProfileAvatar, profile.color, profile.name, roomId]
+    [roomId]
   );
+
+  const updateProfile = useCallback(
+    (nextProfile: ParticipantProfile) => {
+      setProfile(nextProfile);
+      socketRef.current?.emit("cursor:profile:update", {
+        roomId,
+        name: nextProfile.name,
+        color: nextProfile.color,
+        avatar: nextProfile.avatar
+      });
+    },
+    [roomId]
+  );
+
+  useEffect(() => {
+    const input = colorInputRef.current;
+    if (!input) {
+      return;
+    }
+
+    const commitColor = () => {
+      setColor(input.value);
+      updateProfile({
+        ...profile,
+        color: input.value
+      });
+    };
+
+    input.addEventListener("change", commitColor);
+    return () => input.removeEventListener("change", commitColor);
+  }, [profile, updateProfile]);
+
+  useEffect(() => {
+    if (colorInputRef.current) {
+      colorInputRef.current.value = color;
+    }
+  }, [color]);
 
   const emitCursorLeave = useCallback(() => {
     if (!roomId) {
@@ -492,11 +770,7 @@ export function App() {
 
     emitOperation({
       type: "canvas:clear",
-      canvasId: activeCanvas.id,
-      before: {
-        strokes: activeCanvas.strokes,
-        images: activeCanvas.images
-      }
+      canvasId: activeCanvas.id
     });
   }, [activeCanvas, emitOperation]);
 
@@ -616,6 +890,14 @@ export function App() {
         return;
       }
 
+      if (event.code === "Space") {
+        event.preventDefault();
+        if (!event.repeat) {
+          setTool((current) => (current === "pen" ? "eraser" : "pen"));
+        }
+        return;
+      }
+
       if (event.code === "BracketLeft" || event.code === "BracketRight") {
         event.preventDefault();
         const direction = event.code === "BracketRight" ? 1 : -1;
@@ -672,7 +954,7 @@ export function App() {
           const scale = Math.min(1, maxWidth / image.naturalWidth);
           void uploadImage(src).then((uploadedImage) => {
             const pastedImage: BoardImage = {
-              id: crypto.randomUUID(),
+              id: uploadedImage.id,
               src: uploadedImage.src,
               x: 96,
               y: 96,
@@ -683,7 +965,7 @@ export function App() {
             emitOperation({
               type: "image:add",
               canvasId: activeCanvas.id,
-              image: pastedImage
+              image: imagePlacement(pastedImage)
             });
           });
         };
@@ -784,11 +1066,11 @@ export function App() {
                         type="button"
                         role="menuitem"
                         onClick={() => {
-                          setProfile((current) => ({
-                            ...current,
+                          updateProfile({
+                            ...profile,
                             name: choice.name,
                             avatar: choice.avatar
-                          }));
+                          });
                           setIsEmojiPickerOpen(false);
                         }}
                       >
@@ -803,7 +1085,11 @@ export function App() {
             <label className={styles.colorControl} aria-label="Цвет кисти">
               <span>Цвет</span>
               <span className={styles.colorSwatch} style={{ backgroundColor: color }} />
-              <input type="color" value={color} onChange={(event) => setColor(event.target.value)} />
+              <input
+                ref={colorInputRef}
+                type="color"
+                defaultValue={color}
+              />
             </label>
           </div>
 
@@ -879,16 +1165,52 @@ export function App() {
         <section className={styles.previewPanel} aria-label="Холсты">
           <div className={styles.previewList}>
             {room?.canvases.map((canvas, index) => (
-              <button
-                key={canvas.id}
-                className={styles.previewButton}
-                data-active={canvas.id === activeCanvas?.id}
-                onClick={() => setActiveCanvasId(canvas.id)}
-                type="button"
-              >
-                <CanvasPreview canvas={canvas} />
-                <span>{index + 1}</span>
-              </button>
+              <div key={canvas.id} className={styles.previewItem}>
+                <button
+                  className={styles.previewButton}
+                  data-active={canvas.id === activeCanvas?.id}
+                  onClick={() => setActiveCanvasId(canvas.id)}
+                  type="button"
+                >
+                  <CanvasPreview canvas={canvas} />
+                  <span>{index + 1}</span>
+                </button>
+                {canManageCanvases ? (
+                  <div className={styles.previewActions}>
+                    <button
+                      className={styles.previewActionButton}
+                      type="button"
+                      onClick={() => moveCanvas(canvas.id, index - 1)}
+                      disabled={index === 0}
+                      aria-label={`Переместить холст ${index + 1} вверх`}
+                      title="Переместить вверх"
+                    >
+                      <ArrowUp size={14} />
+                    </button>
+                    <button
+                      className={styles.previewActionButton}
+                      type="button"
+                      onClick={() => moveCanvas(canvas.id, index + 1)}
+                      disabled={index === room.canvases.length - 1}
+                      aria-label={`Переместить холст ${index + 1} вниз`}
+                      title="Переместить вниз"
+                    >
+                      <ArrowDown size={14} />
+                    </button>
+                    <button
+                      className={styles.previewActionButton}
+                      data-danger="true"
+                      type="button"
+                      onClick={() => deleteCanvas(canvas.id)}
+                      disabled={room.canvases.length === 1}
+                      aria-label={`Удалить холст ${index + 1}`}
+                      title="Удалить холст"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ) : null}
+              </div>
             ))}
           </div>
           <button className={styles.addCanvasButton} onClick={addCanvas} type="button">
@@ -1188,7 +1510,7 @@ function applyOptimisticOperation(
       if (operation.type === "image:add") {
         return {
           ...canvas,
-          images: [...canvas.images, operation.image],
+          images: [...canvas.images, boardImage(operation.image)],
           canUndo: true,
           canRedo: false
         };
@@ -1197,7 +1519,7 @@ function applyOptimisticOperation(
       if (operation.type === "image:delete") {
         return {
           ...canvas,
-          images: canvas.images.filter((image) => image.id !== operation.image.id),
+          images: canvas.images.filter((image) => image.id !== operation.imageId),
           canUndo: true,
           canRedo: false
         };
@@ -1216,7 +1538,7 @@ function applyOptimisticOperation(
       return {
         ...canvas,
         images: canvas.images.map((image) =>
-          image.id === operation.after.id ? operation.after : image
+          image.id === operation.image.id ? { ...image, ...operation.image } : image
         ),
         canUndo: true,
         canRedo: false
@@ -1242,11 +1564,7 @@ function applyBroadcastOperation(
         return canvas;
       }
 
-      const nextCanvas = {
-        ...canvas,
-        canUndo: message.canvas.canUndo,
-        canRedo: message.canvas.canRedo
-      };
+      const nextCanvas = canvas;
 
       if (operation.type === "stroke:add") {
         return {
@@ -1262,14 +1580,14 @@ function applyBroadcastOperation(
           ...nextCanvas,
           images: nextCanvas.images.some((image) => image.id === operation.image.id)
             ? nextCanvas.images
-            : [...nextCanvas.images, operation.image]
+            : [...nextCanvas.images, boardImage(operation.image)]
         };
       }
 
       if (operation.type === "image:delete") {
         return {
           ...nextCanvas,
-          images: nextCanvas.images.filter((image) => image.id !== operation.image.id)
+          images: nextCanvas.images.filter((image) => image.id !== operation.imageId)
         };
       }
 
@@ -1284,9 +1602,72 @@ function applyBroadcastOperation(
       return {
         ...nextCanvas,
         images: nextCanvas.images.map((image) =>
-          image.id === operation.after.id ? operation.after : image
+          image.id === operation.image.id ? { ...image, ...operation.image } : image
         )
       };
     })
+  };
+}
+
+function applyCanvasSnapshot(
+  room: RoomSnapshot | null,
+  message: CanvasSnapshotMessage
+): RoomSnapshot | null {
+  if (!room) {
+    return room;
+  }
+
+  return {
+    ...room,
+    updatedAt: message.updatedAt,
+    canvases: room.canvases.map((canvas) =>
+      canvas.id === message.canvas.id
+        ? {
+            ...canvas,
+            ...message.canvas,
+            canUndo: message.canvas.canUndo ?? canvas.canUndo,
+            canRedo: message.canvas.canRedo ?? canvas.canRedo
+          }
+        : canvas
+    )
+  };
+}
+
+function applyHistoryState(
+  room: RoomSnapshot | null,
+  message: HistoryStateMessage
+): RoomSnapshot | null {
+  if (!room) {
+    return room;
+  }
+
+  return {
+    ...room,
+    canvases: room.canvases.map((canvas) =>
+      canvas.id === message.canvasId
+        ? {
+            ...canvas,
+            canUndo: message.canUndo,
+            canRedo: message.canRedo
+          }
+        : canvas
+    )
+  };
+}
+
+function imagePlacement(image: BoardImage) {
+  return {
+    id: image.id,
+    x: image.x,
+    y: image.y,
+    width: image.width,
+    height: image.height
+  };
+}
+
+function boardImage(image: ReturnType<typeof imagePlacement>): BoardImage {
+  return {
+    ...image,
+    src: imageUrl(image.id)
   };
 }

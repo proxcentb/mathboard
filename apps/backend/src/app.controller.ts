@@ -72,7 +72,7 @@ export class AppController {
     @Param("id") id: string,
     @Body() body: { operation: never },
   ): RoomSnapshot {
-    return this.boardService.applyClientOperation(id, body.operation);
+    return this.boardService.applyClientOperation(id, "http", body.operation);
   }
 
   @Get("admin/summary")

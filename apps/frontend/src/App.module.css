@@ -305,6 +305,44 @@
   background: #ffffff;
 }
 
+.previewItem {
+  position: relative;
+  height: 100px;
+}
+
+.previewActions {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  gap: 4px;
+}
+
+.previewActionButton {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.previewActionButton:hover:not(:disabled) {
+  background: var(--surface-muted);
+}
+
+.previewActionButton[data-danger="true"]:hover:not(:disabled) {
+  color: #b91c1c;
+}
+
+.previewActionButton:disabled {
+  color: #a5aca7;
+  background: rgba(243, 244, 242, 0.88);
+}
+
 .previewButton[data-active="true"] {
   border-color: var(--accent);
 }

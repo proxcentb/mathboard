@@ -22,11 +22,16 @@ export interface BoardImage {
   height: number;
 }
 
-export interface CanvasSnapshot {
+export type ImagePlacement = Omit<BoardImage, "src">;
+
+export interface CanvasContent {
   id: string;
   title: string;
   strokes: Stroke[];
   images: BoardImage[];
+}
+
+export interface CanvasSnapshot extends CanvasContent {
   canUndo: boolean;
   canRedo: boolean;
 }
@@ -101,6 +106,16 @@ export interface RemoteCursor {
   point: Point;
 }
 
+export interface RemoteCursorPosition {
+  socketId: string;
+  canvasId: string;
+  point: Point;
+}
+
+export interface RemoteCursorProfile extends ParticipantProfile {
+  socketId: string;
+}
+
 export type RemoteCursorEvent =
   | {
       type: "update";
@@ -151,29 +166,33 @@ export type BoardOperation =
   | {
       type: "image:add";
       canvasId: string;
-      image: BoardImage;
+      image: ImagePlacement;
     }
   | {
       type: "image:update";
       canvasId: string;
-      before: BoardImage;
-      after: BoardImage;
+      image: ImagePlacement;
     }
   | {
       type: "image:delete";
       canvasId: string;
-      image: BoardImage;
+      imageId: string;
     }
   | {
       type: "canvas:clear";
       canvasId: string;
-      before: {
-        strokes: Stroke[];
-        images: BoardImage[];
-      };
     }
   | {
       type: "canvas:create";
+    }
+  | {
+      type: "canvas:move";
+      canvasId: string;
+      toIndex: number;
+    }
+  | {
+      type: "canvas:delete";
+      canvasId: string;
     }
   | {
       type: "history:undo";
@@ -184,23 +203,28 @@ export type BoardOperation =
       canvasId: string;
     };
 
-export type BroadcastOperation =
-  | Extract<
-      BoardOperation,
-      { type: "stroke:add" | "image:add" | "image:update" | "image:delete" }
-    >
-  | {
-      type: "canvas:clear";
-      canvasId: string;
-    };
+export type BroadcastOperation = Extract<
+  BoardOperation,
+  { type: "stroke:add" | "image:add" | "image:update" | "image:delete" | "canvas:clear" }
+>;
 
 export interface OperationAppliedMessage {
   socketId: string;
   operation: BroadcastOperation;
   updatedAt: number;
-  canvas: {
-    id: string;
-    canUndo: boolean;
-    canRedo: boolean;
-  };
+}
+
+export interface CanvasSnapshotMessage {
+  updatedAt: number;
+  canvas: CanvasContent & Partial<Pick<CanvasSnapshot, "canUndo" | "canRedo">>;
+}
+
+export interface HistoryStateMessage {
+  canvasId: string;
+  canUndo: boolean;
+  canRedo: boolean;
+}
+
+export interface RoomRoleMessage {
+  isAdmin: boolean;
 }

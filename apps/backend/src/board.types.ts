@@ -22,11 +22,16 @@ export interface BoardImage {
   height: number;
 }
 
-export interface CanvasSnapshot {
+export type ImagePlacement = Omit<BoardImage, "src">;
+
+export interface CanvasContent {
   id: string;
   title: string;
   strokes: Stroke[];
   images: BoardImage[];
+}
+
+export interface CanvasSnapshot extends CanvasContent {
   canUndo: boolean;
   canRedo: boolean;
 }
@@ -110,10 +115,41 @@ export type BoardOperation =
       };
     };
 
+export type ClientBoardOperation =
+  | Extract<BoardOperation, { type: "stroke:add" }>
+  | {
+      type: "image:add";
+      canvasId: string;
+      image: ImagePlacement;
+    }
+  | {
+      type: "image:update";
+      canvasId: string;
+      image: ImagePlacement;
+    }
+  | {
+      type: "image:delete";
+      canvasId: string;
+      imageId: string;
+    }
+  | {
+      type: "canvas:clear";
+      canvasId: string;
+    };
+
 export type ClientOperation =
-  | BoardOperation
+  | ClientBoardOperation
   | {
       type: "canvas:create";
+    }
+  | {
+      type: "canvas:move";
+      canvasId: string;
+      toIndex: number;
+    }
+  | {
+      type: "canvas:delete";
+      canvasId: string;
     }
   | {
       type: "history:undo";
@@ -125,11 +161,7 @@ export type ClientOperation =
     };
 
 export type BroadcastOperation =
-  | Exclude<BoardOperation, { type: "canvas:clear" }>
-  | {
-      type: "canvas:clear";
-      canvasId: string;
-    };
+  ClientBoardOperation;
 
 export interface ClientOperationMessage {
   roomId: string;
@@ -145,15 +177,20 @@ export interface OperationAppliedMessage {
   socketId: string;
   operation: BroadcastOperation;
   updatedAt: number;
-  canvas: {
-    id: string;
-    canUndo: boolean;
-    canRedo: boolean;
-  };
+}
+
+export interface CanvasSnapshotMessage {
+  updatedAt: number;
+  canvas: CanvasContent | CanvasSnapshot;
 }
 
 export interface JoinRoomMessage {
   roomId: string;
+  userId: string;
+}
+
+export interface RoomRoleMessage {
+  isAdmin: boolean;
 }
 
 export interface ParticipantProfile {
@@ -178,10 +215,14 @@ export type ParticipantAvatar =
 export interface CursorUpdateMessage {
   roomId: string;
   canvasId: string;
-  name: string;
-  color?: string;
-  avatar?: ParticipantAvatar;
   point: Point;
+}
+
+export interface CursorProfileUpdateMessage {
+  roomId: string;
+  name: string;
+  color: string;
+  avatar?: ParticipantAvatar;
 }
 
 export interface CursorLeaveMessage {

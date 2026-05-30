@@ -1,10 +1,16 @@
-import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException
+} from "@nestjs/common";
 import { randomUUID } from "node:crypto";
 import {
   BoardImage,
   BoardOperation,
   AdminRoomSummary,
   CanvasSnapshot,
+  ClientBoardOperation,
   ClientOperation,
   ImportedRoomSnapshot,
   RoomSnapshot,
@@ -16,6 +22,10 @@ interface CanvasState {
   title: string;
   strokes: Stroke[];
   images: BoardImage[];
+  histories: Map<string, UserHistoryState>;
+}
+
+interface UserHistoryState {
   history: BoardOperation[];
   future: BoardOperation[];
 }
@@ -24,6 +34,7 @@ interface RoomState {
   id: string;
   canvases: CanvasState[];
   updatedAt: number;
+  adminUserId?: string;
 }
 
 interface StoredImage {
@@ -48,10 +59,10 @@ export class BoardService {
     return this.toSnapshot(room);
   }
 
-  getOrCreateRoom(id: string): RoomSnapshot {
+  getOrCreateRoom(id: string, userId?: string): RoomSnapshot {
     const existing = this.rooms.get(id);
     if (existing) {
-      return this.toSnapshot(existing);
+      return this.toSnapshot(existing, userId);
     }
 
     const room: RoomState = {
@@ -62,6 +73,16 @@ export class BoardService {
 
     this.rooms.set(id, room);
     return this.toSnapshot(room);
+  }
+
+  claimRoomAdmin(roomId: string, userId: string): boolean {
+    const room = this.rooms.get(roomId);
+    if (!room) {
+      throw new NotFoundException(`Room ${roomId} does not exist`);
+    }
+
+    room.adminUserId ??= userId;
+    return room.adminUserId === userId;
   }
 
   listRooms(): AdminRoomSummary[] {
@@ -76,7 +97,12 @@ export class BoardService {
           0
         );
         const operationCount = room.canvases.reduce(
-          (sum, canvas) => sum + canvas.history.length + canvas.future.length,
+          (sum, canvas) =>
+            sum +
+            Array.from(canvas.histories.values()).reduce(
+              (canvasSum, state) => canvasSum + state.history.length + state.future.length,
+              0
+            ),
           0
         );
 
@@ -131,13 +157,13 @@ export class BoardService {
     const room: RoomState = {
       id: roomId,
       updatedAt: Date.now(),
+      adminUserId: this.rooms.get(roomId)?.adminUserId,
       canvases: snapshot.canvases.map((canvas, index): CanvasState => ({
         id: canvas.id || randomUUID(),
         title: canvas.title || `Холст ${index + 1}`,
         strokes: canvas.strokes,
         images: canvas.images,
-        history: [],
-        future: []
+        histories: new Map()
       }))
     };
 
@@ -174,7 +200,11 @@ export class BoardService {
     return image;
   }
 
-  applyClientOperation(roomId: string, operation: ClientOperation): RoomSnapshot {
+  applyClientOperation(
+    roomId: string,
+    userId: string,
+    operation: ClientOperation
+  ): RoomSnapshot {
     const room = this.rooms.get(roomId);
     if (!room) {
       throw new NotFoundException(`Room ${roomId} does not exist`);
@@ -182,7 +212,42 @@ export class BoardService {
 
     if (operation.type === "canvas:create") {
       room.canvases.push(this.createCanvas(room.canvases.length + 1));
-      return this.touch(room);
+      return this.touch(room, userId);
+    }
+
+    if (operation.type === "canvas:move") {
+      this.assertRoomAdmin(room, userId);
+      const fromIndex = room.canvases.findIndex((canvas) => canvas.id === operation.canvasId);
+      if (fromIndex === -1) {
+        throw new NotFoundException(`Canvas ${operation.canvasId} does not exist`);
+      }
+      if (operation.toIndex < 0 || operation.toIndex >= room.canvases.length) {
+        throw new BadRequestException(`Canvas index ${operation.toIndex} is out of bounds`);
+      }
+      if (fromIndex === operation.toIndex) {
+        return this.toSnapshot(room, userId);
+      }
+
+      const [canvas] = room.canvases.splice(fromIndex, 1);
+      room.canvases.splice(operation.toIndex, 0, canvas);
+      return this.touch(room, userId);
+    }
+
+    if (operation.type === "canvas:delete") {
+      this.assertRoomAdmin(room, userId);
+      if (room.canvases.length === 1) {
+        throw new BadRequestException("Cannot delete the only canvas");
+      }
+
+      const canvasIndex = room.canvases.findIndex((canvas) => canvas.id === operation.canvasId);
+      if (canvasIndex === -1) {
+        throw new NotFoundException(`Canvas ${operation.canvasId} does not exist`);
+      }
+
+      const deletedImageIds = this.imageIdsForCanvas(room.canvases[canvasIndex]);
+      room.canvases.splice(canvasIndex, 1);
+      this.deleteUnusedImages(deletedImageIds);
+      return this.touch(room, userId);
     }
 
     const canvas = room.canvases.find((item) => item.id === operation.canvasId);
@@ -191,30 +256,92 @@ export class BoardService {
     }
 
     if (operation.type === "history:undo") {
-      const last = canvas.history.pop();
+      const state = this.historyFor(canvas, userId);
+      const last = state.history.pop();
       if (last) {
         this.revert(canvas, last);
-        canvas.future.push(last);
+        state.future.push(last);
       }
 
-      return this.touch(room);
+      return this.touch(room, userId);
     }
 
     if (operation.type === "history:redo") {
-      const next = canvas.future.pop();
+      const state = this.historyFor(canvas, userId);
+      const next = state.future.pop();
       if (next) {
         this.apply(canvas, next);
-        canvas.history.push(next);
+        state.history.push(next);
       }
 
-      return this.touch(room);
+      return this.touch(room, userId);
     }
 
-    this.apply(canvas, operation);
-    canvas.history.push(operation);
-    canvas.future = [];
+    const normalizedOperation = this.normalizeOperation(canvas, operation);
+    this.apply(canvas, normalizedOperation);
+    const state = this.historyFor(canvas, userId);
+    state.history.push(normalizedOperation);
+    state.future = [];
 
-    return this.touch(room);
+    return this.touch(room, userId);
+  }
+
+  private normalizeOperation(
+    canvas: CanvasState,
+    operation: ClientBoardOperation
+  ): BoardOperation {
+    if (operation.type === "stroke:add") {
+      return operation;
+    }
+
+    if (operation.type === "image:add") {
+      if (!this.images.has(operation.image.id)) {
+        throw new NotFoundException(`Image ${operation.image.id} does not exist`);
+      }
+
+      return {
+        ...operation,
+        image: {
+          ...operation.image,
+          src: this.imageSrc(operation.image.id)
+        }
+      };
+    }
+
+    if (operation.type === "canvas:clear") {
+      return {
+        ...operation,
+        before: {
+          strokes: canvas.strokes,
+          images: canvas.images
+        }
+      };
+    }
+
+    const existing = canvas.images.find((image) =>
+      image.id === (operation.type === "image:update" ? operation.image.id : operation.imageId)
+    );
+    if (!existing) {
+      throw new NotFoundException("Canvas image does not exist");
+    }
+
+    if (operation.type === "image:delete") {
+      return {
+        type: operation.type,
+        canvasId: operation.canvasId,
+        image: existing
+      };
+    }
+
+    return {
+      type: operation.type,
+      canvasId: operation.canvasId,
+      before: existing,
+      after: {
+        ...existing,
+        ...operation.image
+      }
+    };
   }
 
   private apply(canvas: CanvasState, operation: BoardOperation): void {
@@ -271,23 +398,26 @@ export class BoardService {
     );
   }
 
-  private touch(room: RoomState): RoomSnapshot {
+  private touch(room: RoomState, userId?: string): RoomSnapshot {
     room.updatedAt = Date.now();
-    return this.toSnapshot(room);
+    return this.toSnapshot(room, userId);
   }
 
-  private toSnapshot(room: RoomState): RoomSnapshot {
+  private toSnapshot(room: RoomState, userId?: string): RoomSnapshot {
     return {
       id: room.id,
       updatedAt: room.updatedAt,
-      canvases: room.canvases.map((canvas): CanvasSnapshot => ({
-        id: canvas.id,
-        title: canvas.title,
-        strokes: canvas.strokes,
-        images: canvas.images,
-        canUndo: canvas.history.length > 0,
-        canRedo: canvas.future.length > 0
-      }))
+      canvases: room.canvases.map((canvas): CanvasSnapshot => {
+        const state = userId ? canvas.histories.get(userId) : undefined;
+        return {
+          id: canvas.id,
+          title: canvas.title,
+          strokes: canvas.strokes,
+          images: canvas.images,
+          canUndo: (state?.history.length ?? 0) > 0,
+          canRedo: (state?.future.length ?? 0) > 0
+        };
+      })
     };
   }
 
@@ -297,9 +427,28 @@ export class BoardService {
       title: `Холст ${index}`,
       strokes: [],
       images: [],
+      histories: new Map()
+    };
+  }
+
+  private historyFor(canvas: CanvasState, userId: string): UserHistoryState {
+    const existing = canvas.histories.get(userId);
+    if (existing) {
+      return existing;
+    }
+
+    const state = {
       history: [],
       future: []
     };
+    canvas.histories.set(userId, state);
+    return state;
+  }
+
+  private assertRoomAdmin(room: RoomState, userId: string): void {
+    if (room.adminUserId !== userId) {
+      throw new ForbiddenException("Only the room admin can manage canvases");
+    }
   }
 
   private createReadableId(): string {
@@ -309,14 +458,68 @@ export class BoardService {
   private imageIdsForRoom(room: RoomState): Set<string> {
     const ids = new Set<string>();
     for (const canvas of room.canvases) {
-      for (const image of canvas.images) {
-        const imageId = this.storedImageIdFromSrc(image.src);
-        if (imageId) {
-          ids.add(imageId);
+      for (const imageId of this.imageIdsForCanvas(canvas)) {
+        ids.add(imageId);
+      }
+    }
+    return ids;
+  }
+
+  private imageIdsForCanvas(canvas: CanvasState): Set<string> {
+    const ids = new Set<string>();
+    for (const image of canvas.images) {
+      const imageId = this.storedImageIdFromSrc(image.src);
+      if (imageId) {
+        ids.add(imageId);
+      }
+    }
+
+    for (const state of canvas.histories.values()) {
+      for (const operation of [...state.history, ...state.future]) {
+        for (const image of this.imagesForOperation(operation)) {
+          const imageId = this.storedImageIdFromSrc(image.src);
+          if (imageId) {
+            ids.add(imageId);
+          }
         }
       }
     }
     return ids;
+  }
+
+  private deleteUnusedImages(imageIds: Set<string>): void {
+    const remainingImageIds = new Set<string>();
+    for (const room of this.rooms.values()) {
+      for (const imageId of this.imageIdsForRoom(room)) {
+        remainingImageIds.add(imageId);
+      }
+    }
+
+    for (const imageId of imageIds) {
+      if (!remainingImageIds.has(imageId)) {
+        this.images.delete(imageId);
+      }
+    }
+  }
+
+  private imagesForOperation(operation: BoardOperation): BoardImage[] {
+    if (operation.type === "stroke:add") {
+      return [];
+    }
+
+    if (operation.type === "image:update") {
+      return [operation.before, operation.after];
+    }
+
+    if (operation.type === "canvas:clear") {
+      return operation.before.images;
+    }
+
+    return [operation.image];
+  }
+
+  private imageSrc(id: string): string {
+    return `/api/images/${encodeURIComponent(id)}`;
   }
 
   private storedImageIdFromSrc(src: string): string | null {
