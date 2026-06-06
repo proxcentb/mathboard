@@ -61,8 +61,8 @@ ADMIN_PASSWORD='long-random-password' docker compose up --build -d
 
 Для больших импортов/экспортов конфигурации есть два лимита backend:
 
-- `REQUEST_BODY_LIMIT`, по умолчанию `250mb`, лимит JSON HTTP-запросов.
-- `SOCKET_MAX_HTTP_BUFFER_SIZE`, по умолчанию `262144000`, лимит Socket.IO сообщений.
+- `REQUEST_BODY_LIMIT`, по умолчанию `1gb`, лимит JSON HTTP-запросов.
+- `SOCKET_MAX_HTTP_BUFFER_SIZE`, по умолчанию `1073741824`, лимит Socket.IO сообщений.
 
 Nginx в frontend-контейнере не ограничивает размер тела запроса (`client_max_body_size 0`), поэтому для очень больших конфигураций поднимайте эти backend-переменные под размер вашего сервера.
 

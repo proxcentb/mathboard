@@ -26,18 +26,18 @@ import {
 } from "./board.types";
 
 const PARTICIPANT_PROFILES: Array<Omit<ParticipantProfile, "slot">> = [
-  { name: "🦊", color: "#1d4ed8" },
-  { name: "🐼", color: "#dc2626" },
-  { name: "🐸", color: "#16a34a" },
-  { name: "🐯", color: "#ea580c" },
-  { name: "🐨", color: "#7c3aed" },
-  { name: "🐰", color: "#db2777" },
-  { name: "🐧", color: "#0891b2" },
-  { name: "🐙", color: "#9333ea" },
-  { name: "🦉", color: "#ca8a04" },
-  { name: "🦁", color: "#be123c" },
-  { name: "🐢", color: "#15803d" },
-  { name: "🐳", color: "#0284c7" }
+  { name: "User 1", color: "#1d4ed8", avatarId: "fox" },
+  { name: "User 2", color: "#dc2626", avatarId: "panda" },
+  { name: "User 3", color: "#16a34a", avatarId: "frog" },
+  { name: "User 4", color: "#ea580c", avatarId: "tiger" },
+  { name: "User 5", color: "#7c3aed", avatarId: "koala" },
+  { name: "User 6", color: "#db2777", avatarId: "rabbit" },
+  { name: "User 7", color: "#0891b2", avatarId: "penguin" },
+  { name: "User 8", color: "#9333ea", avatarId: "octopus" },
+  { name: "User 9", color: "#ca8a04", avatarId: "owl" },
+  { name: "User 10", color: "#be123c", avatarId: "lion" },
+  { name: "User 11", color: "#15803d", avatarId: "turtle" },
+  { name: "User 12", color: "#0284c7", avatarId: "whale" }
 ];
 
 @WebSocketGateway({
@@ -45,7 +45,7 @@ const PARTICIPANT_PROFILES: Array<Omit<ParticipantProfile, "slot">> = [
     origin: true,
     credentials: true
   },
-  maxHttpBufferSize: Number(process.env.SOCKET_MAX_HTTP_BUFFER_SIZE ?? 250 * 1024 * 1024)
+  maxHttpBufferSize: Number(process.env.SOCKET_MAX_HTTP_BUFFER_SIZE ?? 1024 * 1024 * 1024)
 })
 export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
@@ -172,7 +172,7 @@ export class BoardGateway implements OnGatewayConnection, OnGatewayDisconnect {
       ...profile,
       name: payload.name,
       color: payload.color,
-      avatar: payload.avatar
+      avatarId: payload.avatarId
     };
     this.participants.get(payload.roomId)?.set(client.id, nextProfile);
     client.broadcast.to(payload.roomId).emit("cursor:profile:update", {

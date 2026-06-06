@@ -197,20 +197,8 @@ export interface ParticipantProfile {
   slot: number;
   name: string;
   color: string;
-  avatar?: ParticipantAvatar;
+  avatarId: string;
 }
-
-export type ParticipantAvatar =
-  | {
-      type: "emoji";
-      value: string;
-    }
-  | {
-      type: "image";
-      name: string;
-      src?: string;
-      alt?: string;
-    };
 
 export interface CursorUpdateMessage {
   roomId: string;
@@ -222,7 +210,7 @@ export interface CursorProfileUpdateMessage {
   roomId: string;
   name: string;
   color: string;
-  avatar?: ParticipantAvatar;
+  avatarId: string;
 }
 
 export interface CursorLeaveMessage {

@@ -31,7 +31,13 @@ import {
 import styles from "./App.module.css";
 import { BoardCanvas } from "./components/BoardCanvas";
 import { CanvasPreview } from "./components/CanvasPreview";
-import { listVisibleCursorAvatars, resolveCursorAvatarSrc } from "./cursorAssets";
+import {
+  DEFAULT_AVATAR_ID,
+  listCursorAvatarChoices,
+  normalizeParticipantAvatarId,
+  resolveCursorAvatarSrc,
+  resolveParticipantAvatar
+} from "./cursorAssets";
 import {
   BoardImage,
   BoardOperation,
@@ -58,25 +64,11 @@ import {
 
 const DEFAULT_PROFILE: ParticipantProfile = {
   slot: 0,
-  name: "🦊",
-  color: "#1d4ed8"
+  name: "User",
+  color: "#1d4ed8",
+  avatarId: DEFAULT_AVATAR_ID
 };
-const PROFILE_EMOJIS = ["🦊", "🐼", "🐸", "🐯", "🐨", "🐰", "🐧", "🐙", "🦉", "🦁", "🐢", "🐳"];
-const PROFILE_CHOICES = [
-  ...PROFILE_EMOJIS.map((emoji) => ({
-    id: emoji,
-    name: emoji,
-    avatar: {
-      type: "emoji",
-      value: emoji
-    } satisfies ParticipantAvatar
-  })),
-  ...listVisibleCursorAvatars().map((avatar) => ({
-    id: `cursor:${avatar.type === "image" ? avatar.name : avatar.value}`,
-    name: avatar.type === "image" ? avatar.name : avatar.value,
-    avatar
-  }))
-];
+const PROFILE_CHOICES = listCursorAvatarChoices();
 const MIN_TOOL_SIZE = 1;
 const MAX_BRUSH_SIZE = 48;
 const MAX_ERASER_SIZE = 120;
@@ -84,7 +76,7 @@ const USER_ID_STORAGE_KEY = "mathboard-user-id";
 
 interface RoomPreferences {
   cursorName: string;
-  cursorAvatar?: ParticipantAvatar;
+  cursorAvatarId: string;
   color: string;
   tool: DrawingTool;
   brushSize: number;
@@ -93,6 +85,7 @@ interface RoomPreferences {
 
 const DEFAULT_ROOM_PREFERENCES: RoomPreferences = {
   cursorName: DEFAULT_PROFILE.name,
+  cursorAvatarId: DEFAULT_PROFILE.avatarId,
   color: DEFAULT_PROFILE.color,
   tool: "pen",
   brushSize: 1,
@@ -149,7 +142,7 @@ function readRoomPreferences(userId: string, roomId: string | null): RoomPrefere
         typeof parsed.cursorName === "string"
           ? parsed.cursorName
           : DEFAULT_ROOM_PREFERENCES.cursorName,
-      cursorAvatar: isParticipantAvatar(parsed.cursorAvatar) ? parsed.cursorAvatar : undefined,
+      cursorAvatarId: readAvatarId(parsed) ?? DEFAULT_ROOM_PREFERENCES.cursorAvatarId,
       color: typeof parsed.color === "string" ? parsed.color : DEFAULT_ROOM_PREFERENCES.color,
       tool: parsed.tool === "eraser" ? "eraser" : "pen",
       brushSize: clampNumber(parsed.brushSize, MIN_TOOL_SIZE, MAX_BRUSH_SIZE, 1),
@@ -170,15 +163,27 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
     : fallback;
 }
 
-function isParticipantAvatar(value: unknown): value is ParticipantAvatar {
-  if (!value || typeof value !== "object") {
-    return false;
+function readAvatarId(value: Partial<RoomPreferences> & { cursorAvatar?: unknown }): string | null {
+  const storedId = normalizeParticipantAvatarId(value.cursorAvatarId);
+  if (storedId) {
+    return storedId;
   }
 
-  const avatar = value as Partial<ParticipantAvatar>;
-  return avatar.type === "emoji"
-    ? typeof avatar.value === "string"
-    : avatar.type === "image" && typeof avatar.name === "string";
+  const avatar = value.cursorAvatar as Partial<ParticipantAvatar> | undefined;
+  if (!avatar || typeof avatar !== "object") {
+    return null;
+  }
+
+  const avatarId = normalizeParticipantAvatarId(avatar.id);
+  if (avatarId) {
+    return avatarId;
+  }
+
+  if (avatar.type === "image") {
+    return normalizeParticipantAvatarId(avatar.name);
+  }
+
+  return avatar.type === "emoji" ? normalizeParticipantAvatarId(avatar.value) : null;
 }
 
 function profileWithPreferences(
@@ -188,7 +193,7 @@ function profileWithPreferences(
   return {
     ...profile,
     name: preferences.cursorName,
-    avatar: preferences.cursorAvatar,
+    avatarId: preferences.cursorAvatarId,
     color: preferences.color
   };
 }
@@ -232,16 +237,11 @@ function parseImportFile(content: string): MathboardExportFile {
 }
 
 function profileAvatar(profile: ParticipantProfile): ParticipantAvatar {
-  return (
-    profile.avatar ?? {
-      type: "emoji",
-      value: profile.name
-    }
-  );
+  return resolveParticipantAvatar(profile.avatarId);
 }
 
 function avatarKey(avatar: ParticipantAvatar): string {
-  return avatar.type === "emoji" ? `emoji:${avatar.value}` : `image:${avatar.name}`;
+  return avatar.id;
 }
 
 function renderAvatar(avatar: ParticipantAvatar, className?: string) {
@@ -297,7 +297,7 @@ function createRemoteCursorController(): RemoteCursorController {
       const cursor = {
         name: profile?.name ?? "?",
         color: profile?.color,
-        avatar: profile?.avatar,
+        avatarId: profile?.avatarId,
         ...position
       };
       cursors.set(cursor.socketId, cursor);
@@ -314,7 +314,7 @@ function createRemoteCursorController(): RemoteCursorController {
         ...cursor,
         name: profile.name,
         color: profile.color,
-        avatar: profile.avatar
+        avatarId: profile.avatarId
       };
       cursors.set(profile.socketId, updatedCursor);
       emit({ type: "update", cursor: updatedCursor });
@@ -449,7 +449,7 @@ export function App() {
           roomId,
           name: restoredProfile.name,
           color: restoredProfile.color,
-          avatar: restoredProfile.avatar
+          avatarId: restoredProfile.avatarId
         });
       }
     });
@@ -581,13 +581,13 @@ export function App() {
 
     writeRoomPreferences(userId, preferencesRoomId, {
       cursorName: profile.name,
-      cursorAvatar: profile.avatar,
+      cursorAvatarId: profile.avatarId,
       color,
       tool,
       brushSize,
       eraserSize
     });
-  }, [brushSize, color, eraserSize, profile.avatar, profile.name, tool, userId]);
+  }, [brushSize, color, eraserSize, profile.avatarId, profile.name, tool, userId]);
 
   const activeCanvas = useMemo(
     () => room?.canvases.find((canvas) => canvas.id === activeCanvasId) ?? room?.canvases[0],
@@ -690,7 +690,7 @@ export function App() {
         roomId,
         name: nextProfile.name,
         color: nextProfile.color,
-        avatar: nextProfile.avatar
+        avatarId: nextProfile.avatarId
       });
     },
     [roomId]
@@ -950,16 +950,14 @@ export function App() {
         const src = String(reader.result);
         const image = new Image();
         image.onload = () => {
-          const maxWidth = 420;
-          const scale = Math.min(1, maxWidth / image.naturalWidth);
           void uploadImage(src).then((uploadedImage) => {
             const pastedImage: BoardImage = {
               id: uploadedImage.id,
               src: uploadedImage.src,
               x: 96,
               y: 96,
-              width: Math.max(80, Math.round(image.naturalWidth * scale)),
-              height: Math.max(80, Math.round(image.naturalHeight * scale))
+              width: image.naturalWidth,
+              height: image.naturalHeight
             };
 
             emitOperation({
@@ -1065,11 +1063,12 @@ export function App() {
                         data-active={avatarKey(choice.avatar) === avatarKey(currentProfileAvatar)}
                         type="button"
                         role="menuitem"
+                        aria-label={choice.label}
                         onClick={() => {
                           updateProfile({
                             ...profile,
-                            name: choice.name,
-                            avatar: choice.avatar
+                            name: choice.label,
+                            avatarId: choice.id
                           });
                           setIsEmojiPickerOpen(false);
                         }}

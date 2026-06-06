@@ -102,7 +102,7 @@ export interface RemoteCursor {
   canvasId: string;
   name: string;
   color?: string;
-  avatar?: ParticipantAvatar;
+  avatarId?: string;
   point: Point;
 }
 
@@ -142,19 +142,23 @@ export interface ParticipantProfile {
   slot: number;
   name: string;
   color: string;
-  avatar?: ParticipantAvatar;
+  avatarId: string;
 }
 
 export type ParticipantAvatar =
   | {
       type: "emoji";
+      id: string;
       value: string;
+      label: string;
     }
   | {
       type: "image";
+      id: string;
       name: string;
       src?: string;
       alt?: string;
+      cursorScale?: number;
     };
 
 export type BoardOperation =
